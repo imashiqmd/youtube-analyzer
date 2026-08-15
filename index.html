@@ -1,0 +1,1069 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>YouTube Title Analyzer</title>
+<meta name="description" content="Find a YouTube channel's best-performing videos (relative to their own history) and see what patterns show up in the titles." />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js" crossorigin></script>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  html, body { background:#f8fafc; font-family:'Inter', ui-sans-serif, system-ui, sans-serif; }
+  .line-clamp-1 { display:-webkit-box; -webkit-line-clamp:1; -webkit-box-orient:vertical; overflow:hidden; }
+  .line-clamp-2 { display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
+  ::-webkit-scrollbar { width:8px; height:8px; }
+  ::-webkit-scrollbar-thumb { background:#e2e8f0; border-radius:9999px; }
+</style>
+</head>
+<body class="min-h-screen bg-slate-50 text-slate-900">
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+const useState = React.useState;
+const useMemo = React.useMemo;
+const useCallback = React.useCallback;
+
+const DEFAULT_API_KEY = "AIzaSyB0-Wl3AsyNO3fZVyRo-K279cN7Qn8I6QM";
+const MAX_PLAYLIST_PAGES = 4; // ~200 most recent uploads
+const PRIOR_WINDOW = 10;
+
+// ---------- plain-JS helpers (no LLM, no search.list) ----------
+
+function parseDurationSeconds(iso) {
+  const m = (iso || "").match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/);
+  if (!m) return 0;
+  const h = parseInt(m[1] || 0, 10);
+  const mnt = parseInt(m[2] || 0, 10);
+  const s = parseInt(m[3] || 0, 10);
+  return h * 3600 + mnt * 60 + s;
+}
+
+function median(arr) {
+  if (!arr.length) return null;
+  const s = arr.slice().sort(function (a, b) { return a - b; });
+  const mid = Math.floor(s.length / 2);
+  return s.length % 2 !== 0 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
+}
+
+function formatNumber(n) {
+  if (n === null || n === undefined) return "—";
+  if (n >= 1000000) return (n / 1000000).toFixed(n >= 10000000 ? 0 : 1) + "M";
+  if (n >= 1000) return (n / 1000).toFixed(n >= 10000 ? 0 : 1) + "K";
+  return String(n);
+}
+
+function formatDate(iso) {
+  const d = new Date(iso);
+  return d.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
+}
+
+function parseChannelInput(raw) {
+  const input = (raw || "").trim();
+  if (!input) return null;
+
+  let url = null;
+  try {
+    url = new URL(/^https?:\/\//i.test(input) ? input : "https://" + input);
+  } catch (e) {
+    url = null;
+  }
+
+  if (url && /(^|\.)youtube\.com$/.test(url.hostname.replace(/^www\./, ""))) {
+    const path = url.pathname.replace(/\/+$/, "");
+    let m;
+    if ((m = path.match(/^\/channel\/(UC[\w-]{20,})/))) {
+      return [{ param: "id", value: m[1] }];
+    }
+    if ((m = path.match(/^\/@([^/]+)/))) {
+      return [{ param: "forHandle", value: "@" + m[1] }];
+    }
+    if ((m = path.match(/^\/c\/([^/]+)/))) {
+      return [
+        { param: "forHandle", value: "@" + m[1] },
+        { param: "forUsername", value: m[1] },
+      ];
+    }
+    if ((m = path.match(/^\/user\/([^/]+)/))) {
+      return [
+        { param: "forUsername", value: m[1] },
+        { param: "forHandle", value: "@" + m[1] },
+      ];
+    }
+    const seg = path.split("/").filter(Boolean).pop();
+    if (seg) return [{ param: "forHandle", value: "@" + seg.replace(/^@/, "") }];
+  }
+
+  if (/^UC[\w-]{20,}$/.test(input)) {
+    return [{ param: "id", value: input }];
+  }
+
+  const handle = input.replace(/^@/, "");
+  return [
+    { param: "forHandle", value: "@" + handle },
+    { param: "forUsername", value: handle.replace(/\s+/g, "") },
+  ];
+}
+
+async function apiGet(endpoint, params, apiKey) {
+  const url = new URL("https://www.googleapis.com/youtube/v3/" + endpoint);
+  Object.keys(params).forEach(function (k) { url.searchParams.set(k, params[k]); });
+  url.searchParams.set("key", apiKey);
+  const res = await fetch(url.toString());
+  const data = await res.json();
+  if (!res.ok) {
+    const msg = (data && data.error && data.error.message) || ("Request failed (" + res.status + ")");
+    throw new Error(msg);
+  }
+  return data;
+}
+
+async function resolveChannel(apiKey, attempts) {
+  for (let i = 0; i < attempts.length; i++) {
+    const attempt = attempts[i];
+    const params = { part: "snippet,statistics,contentDetails" };
+    params[attempt.param] = attempt.value;
+    const data = await apiGet("channels", params, apiKey);
+    if (data.items && data.items.length) {
+      const item = data.items[0];
+      const thumbs = item.snippet.thumbnails || {};
+      return {
+        id: item.id,
+        title: item.snippet.title,
+        thumbnail: (thumbs.default && thumbs.default.url) || (thumbs.medium && thumbs.medium.url) || "",
+        subscriberCount: (item.statistics && !item.statistics.hiddenSubscriberCount)
+          ? Number(item.statistics.subscriberCount) : null,
+        uploadsPlaylistId: item.contentDetails.relatedPlaylists.uploads,
+      };
+    }
+  }
+  throw new Error("Couldn't find that channel. Try the exact @handle or the full channel URL (search.list isn't used, so fuzzy names may not resolve).");
+}
+
+async function fetchAllPlaylistItems(apiKey, playlistId, onProgress) {
+  let items = [];
+  let pageToken = undefined;
+  let page = 0;
+  do {
+    const params = { part: "contentDetails", playlistId: playlistId, maxResults: 50 };
+    if (pageToken) params.pageToken = pageToken;
+    const data = await apiGet("playlistItems", params, apiKey);
+    items = items.concat(data.items || []);
+    pageToken = data.nextPageToken;
+    page++;
+    if (onProgress) onProgress(page, items.length);
+  } while (pageToken && page < MAX_PLAYLIST_PAGES);
+  return items
+    .map(function (it) { return { videoId: it.contentDetails.videoId }; })
+    .filter(function (it) { return !!it.videoId; });
+}
+
+async function fetchVideosDetails(apiKey, videoIds, onProgress) {
+  const chunks = [];
+  for (let i = 0; i < videoIds.length; i += 50) chunks.push(videoIds.slice(i, i + 50));
+  let results = [];
+  for (let i = 0; i < chunks.length; i++) {
+    const data = await apiGet("videos", { part: "snippet,contentDetails,statistics,liveStreamingDetails", id: chunks[i].join(",") }, apiKey);
+    results = results.concat(data.items || []);
+    if (onProgress) onProgress(i + 1, chunks.length);
+  }
+  return results;
+}
+
+function buildVideos(rawItems) {
+  let shortsExcluded = 0;
+  let hiddenExcluded = 0;
+  const videos = [];
+  rawItems.forEach(function (v) {
+    const durationSec = parseDurationSeconds(v.contentDetails.duration);
+    const viewCount = (v.statistics && v.statistics.viewCount !== undefined) ? Number(v.statistics.viewCount) : null;
+    if (durationSec <= 60) { shortsExcluded++; return; }
+    if (viewCount === null) { hiddenExcluded++; return; }
+    const thumbs = v.snippet.thumbnails || {};
+    videos.push({
+      id: v.id,
+      title: v.snippet.title,
+      publishedAt: v.snippet.publishedAt,
+      thumbnail: (thumbs.medium && thumbs.medium.url) || (thumbs.default && thumbs.default.url) || "",
+      durationSec: durationSec,
+      viewCount: viewCount,
+    });
+  });
+  return { videos: videos, shortsExcluded: shortsExcluded, hiddenExcluded: hiddenExcluded };
+}
+
+function computeScores(videos) {
+  const sorted = videos.slice().sort(function (a, b) { return new Date(a.publishedAt) - new Date(b.publishedAt); });
+  return sorted.map(function (v, i) {
+    const windowStart = Math.max(0, i - PRIOR_WINDOW);
+    const priorViews = sorted.slice(windowStart, i).map(function (p) { return p.viewCount; });
+    const med = median(priorViews);
+    const score = (med && med > 0) ? v.viewCount / med : null;
+    return Object.assign({}, v, { priorMedian: med, priorSampleSize: priorViews.length, score: score });
+  });
+}
+
+// ---------- channel publishing behavior (plain JS) ----------
+
+function classifyVideo(v) {
+  const durationSec = parseDurationSeconds(v.contentDetails.duration);
+  const isLive = !!(v.liveStreamingDetails && v.liveStreamingDetails.actualStartTime);
+  const category = isLive ? "live" : (durationSec <= 60 ? "short" : "long");
+  return {
+    id: v.id,
+    publishedAt: v.snippet.publishedAt,
+    durationSec: durationSec,
+    category: category,
+  };
+}
+
+function computeCadence(items) {
+  if (items.length < 2) return null;
+  const sorted = items.slice().sort(function (a, b) { return new Date(a.publishedAt) - new Date(b.publishedAt); });
+  const first = new Date(sorted[0].publishedAt);
+  const last = new Date(sorted[sorted.length - 1].publishedAt);
+  const spanDays = Math.max(1, (last - first) / 86400000);
+  return {
+    sorted: sorted,
+    firstDate: sorted[0].publishedAt,
+    lastDate: sorted[sorted.length - 1].publishedAt,
+    spanDays: spanDays,
+    perWeek: items.length / (spanDays / 7),
+    perMonth: items.length / (spanDays / 30.44),
+    perQuarter: (items.length / (spanDays / 30.44)) * 3,
+  };
+}
+
+function computeConsistency(sortedItems) {
+  if (sortedItems.length < 3) return null;
+  const gaps = [];
+  for (let i = 1; i < sortedItems.length; i++) {
+    gaps.push((new Date(sortedItems[i].publishedAt) - new Date(sortedItems[i - 1].publishedAt)) / 86400000);
+  }
+  const mean = gaps.reduce(function (a, b) { return a + b; }, 0) / gaps.length;
+  const variance = gaps.reduce(function (a, b) { return a + Math.pow(b - mean, 2); }, 0) / gaps.length;
+  const stdDev = Math.sqrt(variance);
+  const cv = mean > 0 ? stdDev / mean : 0;
+  const score = Math.max(0, Math.min(100, Math.round(100 - cv * 100)));
+  return { meanGapDays: mean, stdDevGapDays: stdDev, score: score };
+}
+
+const DAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+function computeHeatmap(items) {
+  const grid = [];
+  for (let d = 0; d < 7; d++) grid.push(new Array(24).fill(0));
+  items.forEach(function (it) {
+    const d = new Date(it.publishedAt);
+    grid[d.getUTCDay()][d.getUTCHours()]++;
+  });
+  let max = 0;
+  const dayTotals = new Array(7).fill(0);
+  const hourTotals = new Array(24).fill(0);
+  for (let d = 0; d < 7; d++) {
+    for (let h = 0; h < 24; h++) {
+      const c = grid[d][h];
+      if (c > max) max = c;
+      dayTotals[d] += c;
+      hourTotals[h] += c;
+    }
+  }
+  let topDay = 0, topHour = 0;
+  for (let d = 1; d < 7; d++) if (dayTotals[d] > dayTotals[topDay]) topDay = d;
+  for (let h = 1; h < 24; h++) if (hourTotals[h] > hourTotals[topHour]) topHour = h;
+  const total = items.length || 1;
+  return {
+    grid: grid,
+    max: max,
+    topDay: DAY_NAMES[topDay],
+    topDayPct: Math.round(100 * dayTotals[topDay] / total),
+    topHour: topHour,
+    topHourPct: Math.round(100 * hourTotals[topHour] / total),
+  };
+}
+
+function computeContentMix(items) {
+  const counts = { live: 0, short: 0, long: 0 };
+  items.forEach(function (it) { counts[it.category]++; });
+  const total = items.length || 1;
+  return {
+    live: counts.live, short: counts.short, long: counts.long,
+    pctLive: Math.round(100 * counts.live / total),
+    pctShort: Math.round(100 * counts.short / total),
+    pctLong: Math.round(100 * counts.long / total),
+  };
+}
+
+function computeBatchRate(sortedItems, thresholdHours) {
+  thresholdHours = thresholdHours || 4;
+  if (sortedItems.length < 2) return 0;
+  let batched = 0;
+  for (let i = 0; i < sortedItems.length; i++) {
+    const t = new Date(sortedItems[i].publishedAt).getTime();
+    const prevGap = i > 0 ? (t - new Date(sortedItems[i - 1].publishedAt).getTime()) / 3600000 : Infinity;
+    const nextGap = i < sortedItems.length - 1 ? (new Date(sortedItems[i + 1].publishedAt).getTime() - t) / 3600000 : Infinity;
+    if (prevGap <= thresholdHours || nextGap <= thresholdHours) batched++;
+  }
+  return Math.round(100 * batched / sortedItems.length);
+}
+
+function formatHour(h) {
+  if (h === 0) return "12 AM";
+  if (h < 12) return h + " AM";
+  if (h === 12) return "12 PM";
+  return (h - 12) + " PM";
+}
+
+function consistencyBand(score) {
+  if (score >= 75) return "Very consistent";
+  if (score >= 50) return "Fairly consistent";
+  if (score >= 25) return "Irregular";
+  return "Erratic";
+}
+
+// ---------- title pattern analysis (plain JS, no LLM) ----------
+
+const STOPWORDS = new Set([
+  "the","a","an","and","or","but","of","to","in","on","for","with","is","are","was","were",
+  "this","that","these","those","it","its","as","at","by","from","be","been","being",
+  "i","we","you","your","our","us","my","me","they","he","she","them","his","her",
+  "not","no","do","does","did","so","if","than","then","there","here","up","out","over",
+  "into","about","just","can","will","have","has","had","2023","2024","2025","2026"
+]);
+
+const POWER_WORDS = [
+  "secret","secrets","best","top","ultimate","amazing","insane","crazy","free","new","easy",
+  "simple","proven","essential","powerful","must","never","always","shocking","surprising",
+  "huge","massive","incredible","perfect","complete","full","final","official","exclusive",
+  "instant","fast","quick","guide","tips","tricks","hacks","mistake","mistakes","truth",
+  "reveal","revealed","why","how","what","stop","avoid","worst","biggest","honest","real",
+  "vs","review","explained"
+];
+
+function tokenize(title) {
+  return (title || "").toLowerCase().replace(/[^\w\s#]/g, " ").split(/\s+/).filter(Boolean);
+}
+
+function wordFrequency(titles, stopwords) {
+  const freq = {};
+  titles.forEach(function (t) {
+    const seen = new Set();
+    tokenize(t).forEach(function (w) {
+      if (stopwords.has(w) || w.length < 2 || /^\d+$/.test(w)) return;
+      if (seen.has(w)) return;
+      seen.add(w);
+      freq[w] = (freq[w] || 0) + 1;
+    });
+  });
+  return Object.entries(freq).sort(function (a, b) { return b[1] - a[1]; });
+}
+
+function powerWordCounts(titles) {
+  const counts = {};
+  titles.forEach(function (t) {
+    const words = new Set(tokenize(t));
+    POWER_WORDS.forEach(function (pw) { if (words.has(pw)) counts[pw] = (counts[pw] || 0) + 1; });
+  });
+  return Object.entries(counts).sort(function (a, b) { return b[1] - a[1]; });
+}
+
+function startPhraseFrequency(titles) {
+  const freq = {};
+  titles.forEach(function (t) {
+    const words = tokenize(t);
+    const phrase = words.slice(0, 2).join(" ");
+    if (!phrase) return;
+    freq[phrase] = (freq[phrase] || 0) + 1;
+  });
+  return Object.entries(freq).sort(function (a, b) { return b[1] - a[1]; });
+}
+
+function titleStats(titles) {
+  const n = titles.length || 1;
+  const lengths = titles.map(function (t) { return t.length; });
+  const wordCounts = titles.map(function (t) { return tokenize(t).length; });
+  function pct(fn) { return Math.round(100 * titles.filter(fn).length / n); }
+  return {
+    avgLength: lengths.reduce(function (a, b) { return a + b; }, 0) / n,
+    avgWords: wordCounts.reduce(function (a, b) { return a + b; }, 0) / n,
+    pctNumber: pct(function (t) { return /\d/.test(t); }),
+    pctQuestion: pct(function (t) { return t.indexOf("?") !== -1; }),
+    pctExclaim: pct(function (t) { return t.indexOf("!") !== -1; }),
+    pctBracket: pct(function (t) { return /[\(\[]/.test(t); }),
+    pctColon: pct(function (t) { return t.indexOf(":") !== -1; }),
+    pctAllCapsWord: pct(function (t) {
+      return t.split(/\s+/).some(function (w) { return w.length >= 3 && w === w.toUpperCase() && /[A-Z]/.test(w); });
+    }),
+  };
+}
+
+function scoreTier(score) {
+  if (score >= 5) return { label: "Viral", cls: "bg-emerald-50 text-emerald-600 border-emerald-100" };
+  if (score >= 2) return { label: "Strong", cls: "bg-sky-50 text-sky-600 border-sky-100" };
+  return { label: "Above avg", cls: "bg-amber-50 text-amber-600 border-amber-100" };
+}
+
+// ---------- icons ----------
+
+function IconGrid(props) {
+  return (
+    <svg className={props.className || "h-4 w-4"} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="3" y="3" width="7" height="7" rx="1.5"></rect>
+      <rect x="14" y="3" width="7" height="7" rx="1.5"></rect>
+      <rect x="3" y="14" width="7" height="7" rx="1.5"></rect>
+      <rect x="14" y="14" width="7" height="7" rx="1.5"></rect>
+    </svg>
+  );
+}
+
+function IconFilm(props) {
+  return (
+    <svg className={props.className || "h-4 w-4"} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="3" y="5" width="18" height="14" rx="2"></rect>
+      <path d="M7 5v14M17 5v14M3 9.5h4M3 14.5h4M17 9.5h4M17 14.5h4"></path>
+    </svg>
+  );
+}
+
+function IconUsers(props) {
+  return (
+    <svg className={props.className || "h-4 w-4"} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="9" cy="8" r="3.2"></circle>
+      <path d="M2.5 19a6.5 6.5 0 0113 0"></path>
+      <circle cx="17.5" cy="9" r="2.6"></circle>
+      <path d="M15.3 19a5 5 0 018.7-1.9"></path>
+    </svg>
+  );
+}
+
+function IconScissors(props) {
+  return (
+    <svg className={props.className || "h-4 w-4"} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="6" cy="6" r="2.4"></circle>
+      <circle cx="6" cy="18" r="2.4"></circle>
+      <path d="M8 7.5L20 19M8 16.5L20 5M9.6 12L7.6 10"></path>
+    </svg>
+  );
+}
+
+function IconCalendar(props) {
+  return (
+    <svg className={props.className || "h-4 w-4"} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="3" y="4.5" width="18" height="16" rx="2"></rect>
+      <path d="M3 9.5h18M8 2.5v4M16 2.5v4"></path>
+    </svg>
+  );
+}
+
+function IconPulse(props) {
+  return (
+    <svg className={props.className || "h-4 w-4"} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M2.5 12h4l2.5-7 4 14 2.5-7h6"></path>
+    </svg>
+  );
+}
+
+function Spinner(props) {
+  return (
+    <svg className={"animate-spin " + (props.className || "h-4 w-4 text-slate-900")} viewBox="0 0 24 24" fill="none">
+      <circle className="opacity-20" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+      <path className="opacity-80" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"></path>
+    </svg>
+  );
+}
+
+// ---------- UI components ----------
+
+function SidebarField(props) {
+  return (
+    <label className="block">
+      <span className="mb-1.5 flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+        {props.icon}
+        {props.label}
+      </span>
+      {props.children}
+    </label>
+  );
+}
+
+function StatCard(props) {
+  return (
+    <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm" title={props.hint}>
+      <div className="flex items-center gap-2 text-sm font-medium text-slate-500">
+        <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-slate-100 text-slate-600">{props.icon}</span>
+        {props.label}
+      </div>
+      <div className="mt-3 text-3xl font-bold text-slate-900">{props.value}</div>
+      <div className="mt-1 text-xs text-slate-400">{props.note}</div>
+    </div>
+  );
+}
+
+function ContentMixBar(props) {
+  const m = props.mix;
+  return (
+    <div>
+      <div className="flex h-3 w-full overflow-hidden rounded-full bg-slate-100">
+        {m.pctLong > 0 && <div className="h-full bg-slate-900" style={{ width: m.pctLong + "%" }}></div>}
+        {m.pctShort > 0 && <div className="h-full bg-sky-500" style={{ width: m.pctShort + "%" }}></div>}
+        {m.pctLive > 0 && <div className="h-full bg-amber-500" style={{ width: m.pctLive + "%" }}></div>}
+      </div>
+      <div className="mt-4 flex flex-wrap gap-x-5 gap-y-2 text-xs text-slate-500">
+        <span className="flex items-center gap-1.5"><span className="h-2 w-2 rounded-full bg-slate-900"></span>Long-form &middot; {m.pctLong}% ({m.long})</span>
+        <span className="flex items-center gap-1.5"><span className="h-2 w-2 rounded-full bg-sky-500"></span>Shorts &middot; {m.pctShort}% ({m.short})</span>
+        <span className="flex items-center gap-1.5"><span className="h-2 w-2 rounded-full bg-amber-500"></span>Live &middot; {m.pctLive}% ({m.live})</span>
+      </div>
+    </div>
+  );
+}
+
+function PublishHeatmap(props) {
+  const heatmap = props.heatmap;
+  return (
+    <div className="overflow-x-auto">
+      <div style={{ minWidth: "620px" }}>
+        <div className="grid" style={{ gridTemplateColumns: "40px repeat(24, 1fr)" }}>
+          <div></div>
+          {Array.from({ length: 24 }).map(function (_, h) {
+            return (
+              <div key={h} className="pb-1 text-center text-[9px] text-slate-400">
+                {h % 4 === 0 ? formatHour(h).replace(" ", "").toLowerCase() : ""}
+              </div>
+            );
+          })}
+          {DAY_NAMES.map(function (dayLabel, d) {
+            return (
+              <React.Fragment key={dayLabel}>
+                <div className="flex items-center pr-2 text-[11px] font-medium text-slate-500">{dayLabel}</div>
+                {heatmap.grid[d].map(function (count, h) {
+                  const intensity = heatmap.max > 0 ? count / heatmap.max : 0;
+                  return (
+                    <div
+                      key={h}
+                      title={dayLabel + " " + formatHour(h) + " UTC — " + count + " upload" + (count === 1 ? "" : "s")}
+                      className="m-[1.5px] aspect-square rounded"
+                      style={{ backgroundColor: count > 0 ? "rgba(15,23,42," + (0.15 + intensity * 0.75).toFixed(2) + ")" : "#f1f5f9" }}
+                    ></div>
+                  );
+                })}
+              </React.Fragment>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function WordBarChart(props) {
+  const items = props.items.slice(0, 8);
+  if (!items.length) {
+    return <p className="text-sm text-slate-400">No strong pattern found.</p>;
+  }
+  const max = items[0][1];
+  return (
+    <div className="flex items-end gap-3 sm:gap-4" style={{ height: "180px" }}>
+      {items.map(function (entry, idx) {
+        const word = entry[0], count = entry[1];
+        const heightPct = Math.max(14, (count / max) * 100);
+        const isTop = idx === 0;
+        return (
+          <div key={word} className="flex h-full flex-1 flex-col items-center gap-2">
+            <div className="relative flex w-full flex-1 items-end justify-center">
+              {isTop && (
+                <div className="absolute -top-9 whitespace-nowrap rounded-lg bg-slate-900 px-2.5 py-1 text-[11px] font-medium text-white shadow-lg">
+                  {count} title{count === 1 ? "" : "s"}
+                </div>
+              )}
+              <div
+                className={"w-full max-w-[34px] rounded-t-lg " + (isTop ? "bg-slate-900" : "border border-slate-200")}
+                style={{
+                  height: heightPct + "%",
+                  backgroundImage: isTop ? "none" : "repeating-linear-gradient(45deg, #e2e8f0 0px, #e2e8f0 1px, transparent 1px, transparent 6px)",
+                  backgroundColor: isTop ? undefined : "#f8fafc",
+                }}
+              ></div>
+            </div>
+            <span className="max-w-[52px] truncate text-[11px] text-slate-500" title={word}>{word}</span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function FreqBars(props) {
+  const items = props.items.slice(0, 6);
+  if (!items.length) {
+    return <p className="text-sm text-slate-400">No strong pattern found.</p>;
+  }
+  const maxCount = items[0][1];
+  return (
+    <div className="space-y-2.5">
+      {items.map(function (entry) {
+        const word = entry[0], count = entry[1];
+        return (
+          <div key={word} className="flex items-center gap-3">
+            <span className="w-24 shrink-0 truncate text-sm text-slate-600" title={word}>{word}</span>
+            <div className="h-2 flex-1 overflow-hidden rounded-full bg-slate-100">
+              <div className="h-full rounded-full bg-slate-900" style={{ width: (count / maxCount * 100) + "%" }}></div>
+            </div>
+            <span className="w-5 shrink-0 text-right text-xs font-medium text-slate-400">{count}</span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function VideoRow(props) {
+  const v = props.v;
+  const tier = scoreTier(v.score);
+  return (
+    <a href={"https://www.youtube.com/watch?v=" + v.id} target="_blank" rel="noopener noreferrer"
+       className="flex items-start gap-3 rounded-xl p-2.5 transition hover:bg-slate-50">
+      <img src={v.thumbnail} alt="" className="h-11 w-11 shrink-0 rounded-lg bg-slate-100 object-cover" />
+      <div className="min-w-0 flex-1">
+        <div className="line-clamp-1 text-sm font-semibold text-slate-900">{v.title}</div>
+        <div className="mt-1 flex items-center gap-1.5">
+          <span className={"rounded-full border px-2 py-0.5 text-[10px] font-semibold " + tier.cls}>{tier.label}</span>
+          <span className="text-xs font-medium text-slate-400">{v.score.toFixed(1)}&times; median</span>
+        </div>
+        <div className="mt-1 text-[11px] text-slate-400">
+          {formatNumber(v.viewCount)} views &middot; {formatDate(v.publishedAt)}
+        </div>
+      </div>
+      <span className="mt-1 shrink-0 text-xs font-semibold text-slate-300">#{props.rank}</span>
+    </a>
+  );
+}
+
+function MetricRow(props) {
+  const m = props.m;
+  const fmt = function (n) { return m.decimals ? n.toFixed(m.decimals) : Math.round(n); };
+  const topDisplay = fmt(m.top);
+  const baseDisplay = fmt(m.base);
+  const diff = Number(topDisplay) - Number(baseDisplay);
+  const up = diff > 0;
+  const down = diff < 0;
+  return (
+    <tr>
+      <td className="px-6 py-3 text-sm font-medium text-slate-700">{m.label}</td>
+      <td className="px-6 py-3 text-sm font-semibold text-slate-900">{topDisplay}{m.unit}</td>
+      <td className="px-6 py-3 text-sm text-slate-500">{baseDisplay}{m.unit}</td>
+      <td className="px-6 py-3">
+        <span className={"inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-semibold " +
+          (up ? "bg-emerald-50 text-emerald-600" : down ? "bg-rose-50 text-rose-600" : "bg-slate-100 text-slate-400")}>
+          {up ? "▲" : down ? "▼" : "–"} {fmt(Math.abs(diff))}{m.unit}
+        </span>
+      </td>
+    </tr>
+  );
+}
+
+function EmptyState() {
+  return (
+    <div className="flex flex-col items-center justify-center rounded-2xl border border-dashed border-slate-300 bg-white px-6 py-20 text-center">
+      <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-slate-900 text-white">
+        <IconFilm className="h-5 w-5" />
+      </div>
+      <h3 className="mt-4 text-base font-semibold text-slate-900">No analysis yet</h3>
+      <p className="mt-1 max-w-sm text-sm text-slate-400">
+        Fill in a channel on the left and hit Analyze to see its best-performing titles.
+      </p>
+    </div>
+  );
+}
+
+function LoadingState(props) {
+  return (
+    <div className="flex flex-col items-center justify-center rounded-2xl border border-slate-200 bg-white px-6 py-20 text-center shadow-sm">
+      <Spinner className="h-6 w-6 text-slate-900" />
+      <p className="mt-4 text-sm font-medium text-slate-700">{props.message}</p>
+    </div>
+  );
+}
+
+function App() {
+  const [channelInput, setChannelInput] = useState("");
+  const [topN, setTopN] = useState(15);
+  const [phase, setPhase] = useState("idle"); // idle | loading | error | done
+  const [statusMsg, setStatusMsg] = useState("");
+  const [error, setError] = useState(null);
+  const [result, setResult] = useState(null);
+
+  const runAnalysis = useCallback(async function () {
+    setError(null);
+    setResult(null);
+    setPhase("loading");
+    try {
+      const attempts = parseChannelInput(channelInput);
+      if (!attempts) throw new Error("Enter a channel name, @handle, or URL.");
+
+      setStatusMsg("Resolving channel…");
+      const channel = await resolveChannel(DEFAULT_API_KEY, attempts);
+
+      setStatusMsg("Fetching upload list…");
+      const playlistItems = await fetchAllPlaylistItems(DEFAULT_API_KEY, channel.uploadsPlaylistId, function (page, count) {
+        setStatusMsg("Fetching upload list… (page " + page + ", " + count + " videos so far)");
+      });
+      const videoIds = playlistItems.map(function (p) { return p.videoId; });
+      if (!videoIds.length) throw new Error("This channel has no public uploads.");
+
+      setStatusMsg("Fetching details for " + videoIds.length + " videos…");
+      const rawDetails = await fetchVideosDetails(DEFAULT_API_KEY, videoIds, function (done, total) {
+        setStatusMsg("Fetching video details… (batch " + done + "/" + total + ")");
+      });
+
+      setStatusMsg("Computing performance scores…");
+      const built = buildVideos(rawDetails);
+      if (built.videos.length < 2) {
+        throw new Error("Not enough long-form videos with public view counts to analyze.");
+      }
+      const scored = computeScores(built.videos);
+      const rankable = scored.filter(function (v) { return v.score !== null; });
+      const top = rankable.slice().sort(function (a, b) { return b.score - a.score; }).slice(0, topN);
+
+      setStatusMsg("Analyzing publishing behavior…");
+      const classified = rawDetails.map(classifyVideo);
+      const cadence = computeCadence(classified);
+      const consistency = cadence ? computeConsistency(cadence.sorted) : null;
+      const heatmap = computeHeatmap(classified);
+      const contentMix = computeContentMix(classified);
+      const batchRate = cadence ? computeBatchRate(cadence.sorted) : null;
+      const liveItems = classified.filter(function (it) { return it.category === "live"; });
+      const regularItems = classified.filter(function (it) { return it.category !== "live"; });
+      const liveCadence = computeCadence(liveItems);
+      const regularCadence = computeCadence(regularItems);
+
+      setResult({
+        channel: channel,
+        totalFetched: rawDetails.length,
+        shortsExcluded: built.shortsExcluded,
+        hiddenExcluded: built.hiddenExcluded,
+        analyzed: scored.length,
+        top: top,
+        allTitles: scored.map(function (v) { return v.title; }),
+        cadence: cadence,
+        consistency: consistency,
+        heatmap: heatmap,
+        contentMix: contentMix,
+        batchRate: batchRate,
+        liveCadence: liveCadence,
+        regularCadence: regularCadence,
+      });
+      setPhase("done");
+    } catch (e) {
+      setError(e && e.message ? e.message : String(e));
+      setPhase("error");
+    }
+  }, [channelInput, topN]);
+
+  const patternData = useMemo(function () {
+    if (!result) return null;
+    const topTitles = result.top.map(function (v) { return v.title; });
+    const topStats = titleStats(topTitles);
+    const baseStats = titleStats(result.allTitles);
+    return {
+      words: wordFrequency(topTitles, STOPWORDS),
+      powerWords: powerWordCounts(topTitles),
+      startPhrases: startPhraseFrequency(topTitles),
+      metrics: [
+        { label: "Avg length", top: topStats.avgLength, base: baseStats.avgLength, unit: " chars", decimals: 0 },
+        { label: "Avg word count", top: topStats.avgWords, base: baseStats.avgWords, unit: "", decimals: 1 },
+        { label: "Uses a number", top: topStats.pctNumber, base: baseStats.pctNumber, unit: "%", decimals: 0 },
+        { label: "Question mark", top: topStats.pctQuestion, base: baseStats.pctQuestion, unit: "%", decimals: 0 },
+        { label: "Exclamation mark", top: topStats.pctExclaim, base: baseStats.pctExclaim, unit: "%", decimals: 0 },
+        { label: "Brackets ( [", top: topStats.pctBracket, base: baseStats.pctBracket, unit: "%", decimals: 0 },
+        { label: "Colon :", top: topStats.pctColon, base: baseStats.pctColon, unit: "%", decimals: 0 },
+        { label: "ALL-CAPS word", top: topStats.pctAllCapsWord, base: baseStats.pctAllCapsWord, unit: "%", decimals: 0 },
+      ],
+    };
+  }, [result]);
+
+  const inputCls = "w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-900 placeholder-slate-400 outline-none transition focus:border-slate-400 focus:bg-white";
+
+  return (
+    <div className="flex min-h-screen flex-col bg-slate-50 md:flex-row">
+      <aside className="w-full shrink-0 border-b border-slate-200 bg-white md:sticky md:top-0 md:h-screen md:w-72 md:overflow-y-auto md:border-b-0 md:border-r">
+        <div className="flex flex-col gap-6 px-5 py-6">
+          <div className="flex items-center gap-2">
+            <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-slate-900 text-sm font-bold text-white">Y</div>
+            <span className="text-lg font-bold text-slate-900">Title Analyzer</span>
+          </div>
+
+          <div>
+            <div className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-slate-400">Configuration</div>
+            <div className="space-y-3">
+              <SidebarField label="Channel" icon={<span className="text-sm font-semibold leading-none">@</span>}>
+                <input
+                  type="text"
+                  value={channelInput}
+                  onChange={function (e) { setChannelInput(e.target.value); }}
+                  onKeyDown={function (e) { if (e.key === "Enter" && phase !== "loading") runAnalysis(); }}
+                  placeholder="@MKBHD or youtube.com/@MKBHD"
+                  className={inputCls}
+                />
+              </SidebarField>
+
+              <SidebarField label="Top videos" icon={<IconFilm className="h-3.5 w-3.5" />}>
+                <input
+                  type="number"
+                  min="5"
+                  max="30"
+                  value={topN}
+                  onChange={function (e) {
+                    const v = parseInt(e.target.value, 10);
+                    setTopN(isNaN(v) ? 15 : Math.min(30, Math.max(5, v)));
+                  }}
+                  className={inputCls}
+                />
+              </SidebarField>
+            </div>
+          </div>
+
+          <button
+            onClick={runAnalysis}
+            disabled={phase === "loading"}
+            className="flex w-full items-center justify-center gap-2 rounded-xl bg-slate-900 py-2.5 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {phase === "loading" && <Spinner className="h-4 w-4 text-white" />}
+            {phase === "loading" ? "Analyzing…" : "Analyze channel"}
+          </button>
+
+          {phase === "loading" && (
+            <div className="-mt-3 flex items-start gap-2 text-xs text-slate-500">
+              <span>{statusMsg}</span>
+            </div>
+          )}
+
+          {phase === "error" && error && (
+            <div className="-mt-3 rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-600">
+              {error}
+            </div>
+          )}
+
+          <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+            <div className="text-xs font-semibold text-slate-700">No search.list calls</div>
+            <div className="mt-1 text-[11px] leading-relaxed text-slate-500">
+              channels.list &rarr; playlistItems.list &rarr; videos.list only (&lt;10 quota units).
+              Client-side only, no backend, no LLM calls.
+            </div>
+          </div>
+        </div>
+      </aside>
+
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center justify-between border-b border-slate-200 bg-white px-5 py-4 sm:px-8">
+          <div className="flex items-center gap-2 text-sm text-slate-400">
+            <IconGrid className="h-4 w-4" />
+            <span>Title Analyzer</span>
+            <span className="text-slate-300">/</span>
+            <span className="font-medium text-slate-900">{result ? result.channel.title : "Overview"}</span>
+          </div>
+          {result && result.channel.thumbnail && (
+            <img src={result.channel.thumbnail} alt="" className="h-8 w-8 rounded-full bg-slate-100" />
+          )}
+        </div>
+
+        <main className="px-5 py-6 sm:px-8 sm:py-8">
+          <div className="mb-6">
+            <h1 className="text-2xl font-bold text-slate-900 sm:text-3xl">
+              {result ? <>Results for {result.channel.title} <span>&#128075;</span></> : <>Find your best titles <span>&#128075;</span></>}
+            </h1>
+            <p className="mt-1 max-w-2xl text-sm text-slate-500">
+              {result
+                ? "Videos ranked by views relative to the channel's own recent history — not raw view count."
+                : "Enter a channel on the left, then hit Analyze."}
+            </p>
+          </div>
+
+          {phase === "loading" && <LoadingState message={statusMsg} />}
+          {phase === "idle" && <EmptyState />}
+          {phase === "error" && !result && (
+            <div className="rounded-2xl border border-rose-200 bg-rose-50 px-6 py-8 text-center text-sm text-rose-600">
+              {error}
+            </div>
+          )}
+
+          {result && (
+            <div className="space-y-6">
+              <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+                <StatCard
+                  icon={<IconUsers className="h-4 w-4" />}
+                  label="Subscribers"
+                  value={result.channel.subscriberCount !== null ? formatNumber(result.channel.subscriberCount) : "Hidden"}
+                  note="public count"
+                />
+                <StatCard
+                  icon={<IconFilm className="h-4 w-4" />}
+                  label="Videos Analyzed"
+                  value={result.analyzed}
+                  note={"of " + result.totalFetched + " scanned"}
+                />
+                <StatCard
+                  icon={<IconScissors className="h-4 w-4" />}
+                  label="Shorts Excluded"
+                  value={result.shortsExcluded}
+                  note="≤60s runtime"
+                />
+              </div>
+
+              <div>
+                <div className="mb-3 flex items-center justify-between">
+                  <h2 className="text-base font-bold text-slate-900">Publishing Behavior</h2>
+                  <span className="text-xs text-slate-400">
+                    {result.cadence ? formatDate(result.cadence.firstDate) + " – " + formatDate(result.cadence.lastDate) : ""}
+                  </span>
+                </div>
+
+                <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
+                  <StatCard
+                    icon={<IconCalendar className="h-4 w-4" />}
+                    label="Per Week"
+                    value={result.cadence ? result.cadence.perWeek.toFixed(1) : "—"}
+                    note="videos / week"
+                  />
+                  <StatCard
+                    icon={<IconCalendar className="h-4 w-4" />}
+                    label="Per Month"
+                    value={result.cadence ? result.cadence.perMonth.toFixed(1) : "—"}
+                    note="videos / month"
+                  />
+                  <StatCard
+                    icon={<IconCalendar className="h-4 w-4" />}
+                    label="Per Quarter"
+                    value={result.cadence ? result.cadence.perQuarter.toFixed(1) : "—"}
+                    note="videos / quarter"
+                  />
+                  <StatCard
+                    icon={<IconPulse className="h-4 w-4" />}
+                    label="Consistency"
+                    value={result.consistency ? result.consistency.score : "—"}
+                    note={result.consistency ? consistencyBand(result.consistency.score) : "not enough data"}
+                    hint="100 − (std dev ÷ mean gap × 100), clamped 0–100. Higher = more consistent upload gaps."
+                  />
+                </div>
+
+                <div className="mt-4 grid gap-4 lg:grid-cols-5">
+                  <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm lg:col-span-2">
+                    <h3 className="text-sm font-semibold text-slate-900">Content Mix</h3>
+                    <div className="mb-4 mt-1 text-xs text-slate-400">Long-form vs Shorts vs Live, last {result.totalFetched} uploads</div>
+                    <ContentMixBar mix={result.contentMix} />
+                    <div className="mt-4 grid grid-cols-2 gap-3 text-xs">
+                      <div className="rounded-lg bg-slate-50 px-3 py-2">
+                        <div className="text-slate-400">Live frequency</div>
+                        <div className="mt-0.5 font-semibold text-slate-900">
+                          {result.liveCadence ? result.liveCadence.perMonth.toFixed(1) + "/mo" : result.contentMix.live + " total"}
+                        </div>
+                      </div>
+                      <div className="rounded-lg bg-slate-50 px-3 py-2">
+                        <div className="text-slate-400">Regular frequency</div>
+                        <div className="mt-0.5 font-semibold text-slate-900">
+                          {result.regularCadence ? result.regularCadence.perMonth.toFixed(1) + "/mo" : (result.contentMix.long + result.contentMix.short) + " total"}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm lg:col-span-3">
+                    <h3 className="text-sm font-semibold text-slate-900">Publish Time Heatmap</h3>
+                    <div className="mb-4 mt-1 text-xs text-slate-400">Uploads by day &amp; hour (UTC)</div>
+                    <PublishHeatmap heatmap={result.heatmap} />
+                    <div className="mt-4 flex flex-wrap gap-2">
+                      <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-medium text-slate-600">
+                        Most active day: {result.heatmap.topDay} &middot; {result.heatmap.topDayPct}%
+                      </span>
+                      <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-medium text-slate-600">
+                        Most active hour: {formatHour(result.heatmap.topHour)} UTC &middot; {result.heatmap.topHourPct}%
+                      </span>
+                      {result.batchRate !== null && (
+                        <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-medium text-slate-600">
+                          Batch uploads: {result.batchRate}% within 4h of another
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="grid gap-6 lg:grid-cols-5">
+                <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm lg:col-span-3">
+                  <div className="flex items-center justify-between">
+                    <h2 className="text-base font-bold text-slate-900">Most Common Words</h2>
+                    <span className="rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-500">
+                      Top {result.top.length} titles
+                    </span>
+                  </div>
+                  <div className="mt-1 text-xs text-slate-400">Words repeated across your top-performing titles</div>
+                  <div className="mt-9">
+                    <WordBarChart items={patternData.words} />
+                  </div>
+                </div>
+
+                <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm lg:col-span-2">
+                  <h2 className="text-base font-bold text-slate-900">Top Performing Videos</h2>
+                  <div className="mb-2 mt-1 text-xs text-slate-400">
+                    Ranked by views &divide; median of the {PRIOR_WINDOW} prior uploads
+                  </div>
+                  <div className="max-h-[420px] space-y-1 overflow-y-auto pr-1">
+                    {result.top.map(function (v, i) {
+                      return <VideoRow key={v.id} v={v} rank={i + 1} />;
+                    })}
+                  </div>
+                </div>
+              </div>
+
+              <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
+                <div className="flex items-center justify-between border-b border-slate-100 px-6 py-4">
+                  <h2 className="text-base font-bold text-slate-900">Title Patterns</h2>
+                  <span className="text-xs text-slate-400">Top performers vs. channel average</span>
+                </div>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left">
+                    <thead>
+                      <tr className="text-[11px] uppercase tracking-wide text-slate-400">
+                        <th className="px-6 py-2 font-medium">Metric</th>
+                        <th className="px-6 py-2 font-medium">Top performers</th>
+                        <th className="px-6 py-2 font-medium">Channel avg</th>
+                        <th className="px-6 py-2 font-medium">Delta</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {patternData.metrics.map(function (m) {
+                        return <MetricRow key={m.label} m={m} />;
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              <div className="grid gap-6 sm:grid-cols-2">
+                <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+                  <h3 className="mb-3 text-sm font-semibold text-slate-900">Power / clickbait words</h3>
+                  <FreqBars items={patternData.powerWords} />
+                </div>
+                <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+                  <h3 className="mb-3 text-sm font-semibold text-slate-900">Common opening words</h3>
+                  <FreqBars items={patternData.startPhrases} />
+                </div>
+              </div>
+            </div>
+          )}
+
+          <footer className="mt-10 text-center text-xs text-slate-400">
+            Client-side only &middot; YouTube Data API v3 &middot; no backend, no LLM calls.
+          </footer>
+        </main>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
