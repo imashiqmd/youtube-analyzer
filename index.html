@@ -100,7 +100,11 @@ async function apiRequest(path, options) {
     body: opts.body ? JSON.stringify(opts.body) : undefined,
   });
   const data = await res.json().catch(function () { return {}; });
-  if (!res.ok) throw new Error(data.error || ("Request failed (" + res.status + ")"));
+  if (!res.ok) {
+    const err = new Error(data.error || ("Request failed (" + res.status + ")"));
+    if (data.code) err.code = data.code;
+    throw err;
+  }
   return data;
 }
 
@@ -142,7 +146,7 @@ async function analyzeChannelViaApi(handle, onProgress, options) {
     try {
       const data = await apiRequest("/channels/" + encodeURIComponent(opts.channelId));
       if (onProgress) onProgress("Loaded from saved data…");
-      return { entry: apiResponseToCacheEntry(data) };
+      return { entry: apiResponseToCacheEntry(data), usage: data.usage || null };
     } catch (e) {
       if (e && e.message && e.message.indexOf("not found") < 0) throw e;
     }
@@ -156,6 +160,7 @@ async function analyzeChannelViaApi(handle, onProgress, options) {
   }
   return {
     entry: apiResponseToCacheEntry(data),
+    usage: data.usage || null,
   };
 }
 
@@ -4123,6 +4128,18 @@ function LoadingState(props) {
   );
 }
 
+function ChannelUsageBadge(props) {
+  const usage = props.usage;
+  if (!usage || usage.unlimited) return null;
+  const atLimit = usage.analyzedCount >= usage.maxChannels;
+  return (
+    <span className={"inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium " +
+      (atLimit ? "bg-amber-50 text-amber-700" : "bg-slate-100 text-slate-600")}>
+      {usage.analyzedCount}/{usage.maxChannels} channels analyzed
+    </span>
+  );
+}
+
 function AuthScreen(props) {
   const [mode, setMode] = useState("login");
   const [email, setEmail] = useState("");
@@ -4302,6 +4319,7 @@ function App() {
     if (!API_BASE || !getStoredAuthToken()) return null;
     return loadCachedAuthUser();
   });
+  const [channelUsage, setChannelUsage] = useState(null);
   const [authLoading, setAuthLoading] = useState(function () {
     if (!API_BASE) return false;
     return !!getStoredAuthToken() && !loadCachedAuthUser();
@@ -4335,6 +4353,7 @@ function App() {
     apiRequest("/auth/me")
       .then(function (data) {
         setAuthUser(data.user);
+        setChannelUsage(data.usage || null);
         persistCachedAuthUser(data.user);
         refreshSavedChannelsInBackground(setFavorites);
       })
@@ -4354,6 +4373,7 @@ function App() {
     }
     clearAuthToken();
     setAuthUser(null);
+    setChannelUsage(null);
     setResult(null);
     setPhase("idle");
     setError(null);
@@ -4412,6 +4432,8 @@ function App() {
         if (gen !== analysisGenRef.current) return;
         setStatusMsg(msg);
       }, { channelId: cacheEntry.channelId });
+      if (gen !== analysisGenRef.current) return;
+      if (response.usage) setChannelUsage(response.usage);
       let entry = response.entry;
       entry = await mergeLocalTopicClassifications(entry);
       if (gen !== analysisGenRef.current) return;
@@ -4507,6 +4529,7 @@ function App() {
           setStatusMsg(msg);
         }, { channelId: opts.channelId });
         if (gen !== analysisGenRef.current) return;
+        if (response.usage) setChannelUsage(response.usage);
         let entry = response.entry;
         entry = await mergeLocalTopicClassifications(entry);
         setActivityRange(DEFAULT_ACTIVITY_RANGE);
@@ -4661,6 +4684,9 @@ function App() {
       setAuthUser(user);
       persistCachedAuthUser(user);
       refreshSavedChannelsInBackground(setFavorites);
+      apiRequest("/auth/me").then(function (data) {
+        if (data.usage) setChannelUsage(data.usage);
+      }).catch(function () { /* ignore */ });
     }} />;
   }
 
@@ -4682,6 +4708,14 @@ function App() {
                 <div className="min-w-0 xl:text-right">
                   <div className="truncate text-sm font-medium text-slate-800">{authUser.displayName}</div>
                   <div className="hidden truncate text-xs text-slate-400 sm:block">{authUser.email}</div>
+                  <div className="mt-1 hidden sm:block">
+                    <ChannelUsageBadge usage={channelUsage} />
+                    {authUser.isAdmin ? (
+                      <span className="ml-1 inline-flex items-center rounded-full bg-violet-50 px-2 py-0.5 text-[11px] font-medium text-violet-700">
+                        Admin · unlimited
+                      </span>
+                    ) : null}
+                  </div>
                 </div>
                 <button
                   type="button"

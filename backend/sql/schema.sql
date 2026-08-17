@@ -87,6 +87,15 @@ CREATE TABLE IF NOT EXISTS user_activity (
 CREATE INDEX IF NOT EXISTS idx_user_activity_user_created ON user_activity (user_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_user_activity_created ON user_activity (created_at DESC);
 
+CREATE TABLE IF NOT EXISTS user_analyzed_channels (
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  channel_id TEXT NOT NULL,
+  first_analyzed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (user_id, channel_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_analyzed_channels_user ON user_analyzed_channels (user_id);
+
 ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT FALSE;
 
 ALTER TABLE channels ADD COLUMN IF NOT EXISTS cached_videos JSONB NOT NULL DEFAULT '[]'::jsonb;

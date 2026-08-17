@@ -2,13 +2,16 @@ import "dotenv/config";
 import express from "express";
 import compression from "compression";
 import { pool, migrate } from "./db.js";
-import { analyzeChannel, getChannelBundleById } from "./analyzeService.js";
+import { analyzeChannel, getChannelBundleById, resolveCachedChannelId } from "./analyzeService.js";
 import { signUp, signIn, signOut, getUserFromToken, cleanupExpiredSessions } from "./authService.js";
 import {
   listSavedChannels,
   saveChannelForUser,
   removeSavedChannel,
   logUserActivity,
+  assertUserCanAnalyzeChannel,
+  recordUserChannelAnalysis,
+  fetchUserChannelUsage,
 } from "./userService.js";
 import {
   getDashboardStats,
@@ -146,7 +149,8 @@ app.get("/auth/me", async (req, res) => {
     if (!user) {
       return res.status(401).json({ error: "Not signed in." });
     }
-    res.json({ user });
+    const usage = await fetchUserChannelUsage(user.id, user.isAdmin);
+    res.json({ user, usage });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -187,13 +191,18 @@ app.delete("/me/saved-channels/:channelId", requireAuth, async (req, res) => {
 
 app.get("/channels/:channelId", requireAuth, async (req, res) => {
   try {
-    const result = await getChannelBundleById(req.params.channelId);
+    const channelId = req.params.channelId;
+    await assertUserCanAnalyzeChannel(req.user, channelId);
+    const result = await getChannelBundleById(channelId);
     if (!result) {
       return res.status(404).json({ error: "Channel not found. Analyze it first." });
     }
-    res.json(result);
+    await recordUserChannelAnalysis(req.user.id, channelId);
+    const usage = await fetchUserChannelUsage(req.user.id, req.user.isAdmin);
+    res.json({ ...result, usage });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    const status = err.status || 500;
+    res.status(status).json({ error: err.message, code: err.code || undefined });
   }
 });
 
@@ -210,19 +219,26 @@ app.post("/analyze", requireAuth, async (req, res) => {
   }
 
   try {
+    const trimmedHandle = handle.trim();
+    const channelIdHint = await resolveCachedChannelId(trimmedHandle);
+    await assertUserCanAnalyzeChannel(req.user, channelIdHint);
+
     const result = await analyzeChannel({
-      handle: handle.trim(),
+      handle: trimmedHandle,
       apiKey,
       userId: req.user.id,
     });
+    await recordUserChannelAnalysis(req.user.id, result.channelId);
+    const usage = await fetchUserChannelUsage(req.user.id, req.user.isAdmin);
+
     console.log(
-      `[analyze] user=${req.user.email} handle=${handle.trim()} channel=${result.channelId} source=${result.source} units=${result.units_used}`
+      `[analyze] user=${req.user.email} handle=${trimmedHandle} channel=${result.channelId} source=${result.source} units=${result.units_used}`
     );
-    res.json(result);
+    res.json({ ...result, usage });
   } catch (err) {
     const status = err.status || (err.youtubeError ? 502 : 500);
     console.error(`[analyze] handle=${handle} error=${err.message}`);
-    res.status(status).json({ error: err.message });
+    res.status(status).json({ error: err.message, code: err.code || undefined });
   }
 });
 

@@ -58,6 +58,13 @@ export async function findChannelBundleByLookupKey(client, lookupKey) {
   return null;
 }
 
+export async function resolveCachedChannelId(handle) {
+  const lookupKey = lookupHandleKey(handle);
+  if (!lookupKey) return null;
+  const row = await findChannelBundleByLookupKey(pool, lookupKey);
+  return row ? row.channel_id : null;
+}
+
 async function loadVideosFromTable(client, channelId) {
   const { rows } = await client.query(
     `SELECT COALESCE(

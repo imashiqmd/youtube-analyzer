@@ -1,5 +1,7 @@
 import { pool } from "./db.js";
 
+export const MAX_CHANNELS_PER_USER = 5;
+
 export async function logUserActivity(userId, action, { channelId = null, metadata = {} } = {}) {
   if (!userId || !action) return;
   await pool.query(
@@ -55,4 +57,75 @@ export async function removeSavedChannel(userId, channelId) {
     await logUserActivity(userId, "unsave_channel", { channelId });
   }
   return rowCount > 0;
+}
+
+export async function countUserAnalyzedChannels(userId) {
+  const { rows } = await pool.query(
+    `SELECT COUNT(*)::int AS count
+     FROM user_analyzed_channels
+     WHERE user_id = $1`,
+    [userId]
+  );
+  return rows[0]?.count || 0;
+}
+
+export async function hasUserAnalyzedChannel(userId, channelId) {
+  if (!userId || !channelId) return false;
+  const { rows } = await pool.query(
+    `SELECT 1 FROM user_analyzed_channels
+     WHERE user_id = $1 AND channel_id = $2
+     LIMIT 1`,
+    [userId, channelId]
+  );
+  return rows.length > 0;
+}
+
+export async function recordUserChannelAnalysis(userId, channelId) {
+  if (!userId || !channelId) return;
+  await pool.query(
+    `INSERT INTO user_analyzed_channels (user_id, channel_id)
+     VALUES ($1, $2)
+     ON CONFLICT (user_id, channel_id) DO NOTHING`,
+    [userId, channelId]
+  );
+}
+
+export function getUserChannelUsage(analyzedCount, isAdmin) {
+  if (isAdmin) {
+    return {
+      analyzedCount,
+      maxChannels: null,
+      unlimited: true,
+    };
+  }
+  return {
+    analyzedCount,
+    maxChannels: MAX_CHANNELS_PER_USER,
+    unlimited: false,
+    remaining: Math.max(0, MAX_CHANNELS_PER_USER - analyzedCount),
+  };
+}
+
+export async function fetchUserChannelUsage(userId, isAdmin) {
+  const analyzedCount = await countUserAnalyzedChannels(userId);
+  return getUserChannelUsage(analyzedCount, isAdmin);
+}
+
+export async function assertUserCanAnalyzeChannel(user, channelId = null) {
+  if (!user || user.isAdmin) return;
+
+  if (channelId && await hasUserAnalyzedChannel(user.id, channelId)) {
+    return;
+  }
+
+  const analyzedCount = await countUserAnalyzedChannels(user.id);
+  if (analyzedCount >= MAX_CHANNELS_PER_USER) {
+    const err = new Error(
+      "You've reached the limit of " + MAX_CHANNELS_PER_USER + " channels. " +
+      "Re-open a channel you've already analyzed, or contact an admin for unlimited access."
+    );
+    err.status = 403;
+    err.code = "CHANNEL_LIMIT_REACHED";
+    throw err;
+  }
 }
