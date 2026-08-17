@@ -1,6 +1,5 @@
 import { pool } from "./db.js";
-
-export const MAX_CHANNELS_PER_USER = 5;
+import { getMaxChannelsPerUser } from "./settingsService.js";
 
 export async function logUserActivity(userId, action, { channelId = null, metadata = {} } = {}) {
   if (!userId || !action) return;
@@ -90,7 +89,27 @@ export async function recordUserChannelAnalysis(userId, channelId) {
   );
 }
 
-export function getUserChannelUsage(analyzedCount, isAdmin) {
+export async function listUserAnalyzedChannels(userId) {
+  const { rows } = await pool.query(
+    `SELECT uac.channel_id, uac.first_analyzed_at,
+            COALESCE(c.channel_data->>'title', usc.title, uac.channel_id) AS title,
+            c.handle
+     FROM user_analyzed_channels uac
+     LEFT JOIN channels c ON c.channel_id = uac.channel_id
+     LEFT JOIN user_saved_channels usc ON usc.user_id = uac.user_id AND usc.channel_id = uac.channel_id
+     WHERE uac.user_id = $1
+     ORDER BY uac.first_analyzed_at DESC`,
+    [userId]
+  );
+  return rows.map((row) => ({
+    channelId: row.channel_id,
+    title: row.title,
+    handle: row.handle || "",
+    analyzedAt: row.first_analyzed_at,
+  }));
+}
+
+export function buildUserChannelUsage(analyzedCount, isAdmin, maxChannels) {
   if (isAdmin) {
     return {
       analyzedCount,
@@ -100,15 +119,18 @@ export function getUserChannelUsage(analyzedCount, isAdmin) {
   }
   return {
     analyzedCount,
-    maxChannels: MAX_CHANNELS_PER_USER,
+    maxChannels,
     unlimited: false,
-    remaining: Math.max(0, MAX_CHANNELS_PER_USER - analyzedCount),
+    remaining: Math.max(0, maxChannels - analyzedCount),
   };
 }
 
 export async function fetchUserChannelUsage(userId, isAdmin) {
-  const analyzedCount = await countUserAnalyzedChannels(userId);
-  return getUserChannelUsage(analyzedCount, isAdmin);
+  const [analyzedCount, maxChannels] = await Promise.all([
+    countUserAnalyzedChannels(userId),
+    getMaxChannelsPerUser(),
+  ]);
+  return buildUserChannelUsage(analyzedCount, isAdmin, maxChannels);
 }
 
 export async function assertUserCanAnalyzeChannel(user, channelId = null) {
@@ -118,10 +140,14 @@ export async function assertUserCanAnalyzeChannel(user, channelId = null) {
     return;
   }
 
-  const analyzedCount = await countUserAnalyzedChannels(user.id);
-  if (analyzedCount >= MAX_CHANNELS_PER_USER) {
+  const [analyzedCount, maxChannels] = await Promise.all([
+    countUserAnalyzedChannels(user.id),
+    getMaxChannelsPerUser(),
+  ]);
+
+  if (analyzedCount >= maxChannels) {
     const err = new Error(
-      "You've reached the limit of " + MAX_CHANNELS_PER_USER + " channels. " +
+      "You've reached the limit of " + maxChannels + " channels. " +
       "Re-open a channel you've already analyzed, or contact an admin for unlimited access."
     );
     err.status = 403;

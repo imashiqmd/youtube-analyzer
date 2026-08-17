@@ -96,6 +96,16 @@ CREATE TABLE IF NOT EXISTS user_analyzed_channels (
 
 CREATE INDEX IF NOT EXISTS idx_user_analyzed_channels_user ON user_analyzed_channels (user_id);
 
+CREATE TABLE IF NOT EXISTS app_settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+INSERT INTO app_settings (key, value)
+VALUES ('max_channels_per_user', '5')
+ON CONFLICT (key) DO NOTHING;
+
 ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT FALSE;
 
 ALTER TABLE channels ADD COLUMN IF NOT EXISTS cached_videos JSONB NOT NULL DEFAULT '[]'::jsonb;

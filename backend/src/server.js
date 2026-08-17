@@ -21,6 +21,7 @@ import {
   listQuotaLogs,
   getQuotaStats,
 } from "./adminService.js";
+import { getAppSettings, setMaxChannelsPerUser } from "./settingsService.js";
 
 const app = express();
 const port = Number(process.env.PORT || 3001);
@@ -247,6 +248,31 @@ app.get("/admin/dashboard", requireAdmin, async (_req, res) => {
     res.json(await getDashboardStats());
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/admin/settings", requireAdmin, async (_req, res) => {
+  try {
+    res.json(await getAppSettings());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put("/admin/settings", requireAdmin, async (req, res) => {
+  const maxChannelsPerUser = req.body?.maxChannelsPerUser;
+  if (maxChannelsPerUser === undefined || maxChannelsPerUser === null) {
+    return res.status(400).json({ error: "maxChannelsPerUser is required." });
+  }
+  try {
+    const value = await setMaxChannelsPerUser(maxChannelsPerUser);
+    await logUserActivity(req.user.id, "update_channel_limit", {
+      metadata: { maxChannelsPerUser: value },
+    });
+    res.json({ maxChannelsPerUser: value });
+  } catch (err) {
+    const status = err.status || 500;
+    res.status(status).json({ error: err.message });
   }
 });
 

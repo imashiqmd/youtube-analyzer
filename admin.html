@@ -136,13 +136,154 @@ function AdminTable(props) {
               <tr key={row.id || i} className="hover:bg-slate-50">
                 {props.columns.map(function (col) {
                   let val = typeof col.render === "function" ? col.render(row) : row[col.key];
-                  return <td key={col.key} className="px-4 py-3 text-slate-700">{formatCellValue(val)}</td>;
+                  const content = React.isValidElement(val) ? val : formatCellValue(val);
+                  return <td key={col.key} className="px-4 py-3 text-slate-700">{content}</td>;
                 })}
               </tr>
             );
           })}
         </tbody>
       </table>
+    </div>
+  );
+}
+
+function ChannelLimitSettings(props) {
+  const [limit, setLimit] = useState(String(props.value || 5));
+  const [saving, setSaving] = useState(false);
+  const [message, setMessage] = useState("");
+  const [error, setError] = useState(null);
+
+  useEffect(function () {
+    setLimit(String(props.value || 5));
+  }, [props.value]);
+
+  async function saveLimit(e) {
+    e.preventDefault();
+    setSaving(true);
+    setError(null);
+    setMessage("");
+    try {
+      const data = await apiRequest("/admin/settings", {
+        method: "PUT",
+        body: { maxChannelsPerUser: Number(limit) },
+      });
+      setMessage("Saved — normal users can now analyze up to " + data.maxChannelsPerUser + " channels.");
+      if (props.onSaved) props.onSaved(data.maxChannelsPerUser);
+    } catch (err) {
+      setError(formatApiError(err));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
+      <h2 className="text-sm font-bold uppercase tracking-wide text-slate-500">Channel analysis limit</h2>
+      <p className="mt-1 text-sm text-slate-600">
+        How many different YouTube channels a normal user can analyze. Admins are always unlimited.
+      </p>
+      <form className="mt-4 flex flex-col gap-3 sm:flex-row sm:items-end" onSubmit={saveLimit}>
+        <div className="sm:w-40">
+          <label className="mb-1.5 block text-sm font-medium text-slate-700">Max channels per user</label>
+          <input
+            type="number"
+            min="1"
+            max="1000"
+            required
+            value={limit}
+            onChange={function (e) { setLimit(e.target.value); }}
+            className="w-full rounded-xl border border-slate-200 px-4 py-2.5 text-sm outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-200"
+          />
+        </div>
+        <button
+          type="submit"
+          disabled={saving}
+          className="inline-flex items-center justify-center gap-2 rounded-xl bg-slate-900 px-5 py-2.5 text-sm font-semibold text-white hover:bg-slate-800 disabled:opacity-50"
+        >
+          {saving && <Spinner className="h-4 w-4 text-white" />}
+          {saving ? "Saving…" : "Save limit"}
+        </button>
+      </form>
+      {message && <p className="mt-3 text-sm text-emerald-700">{message}</p>}
+      {error && <p className="mt-3 text-sm text-rose-600">{error}</p>}
+    </div>
+  );
+}
+
+function UsersAnalysisPanel(props) {
+  const [expandedId, setExpandedId] = useState(null);
+  const users = props.users || [];
+  const maxLimit = props.maxChannelsPerUser || 5;
+
+  if (!users.length) return <p className="text-sm text-slate-500">No users yet.</p>;
+
+  return (
+    <div className="space-y-3">
+      {users.map(function (user) {
+        const expanded = expandedId === user.id;
+        const channels = user.analyzedChannels || [];
+        const limitLabel = user.isAdmin
+          ? "Unlimited (admin)"
+          : (user.analyzedCount + "/" + maxLimit + " channels");
+        return (
+          <div key={user.id} className="rounded-xl border border-slate-200 bg-white shadow-sm">
+            <button
+              type="button"
+              onClick={function () { setExpandedId(expanded ? null : user.id); }}
+              className="flex w-full items-center justify-between gap-3 px-4 py-4 text-left hover:bg-slate-50"
+            >
+              <div className="min-w-0">
+                <div className="font-semibold text-slate-900">{user.displayName || user.email}</div>
+                <div className="text-sm text-slate-500">{user.email}</div>
+              </div>
+              <div className="flex shrink-0 items-center gap-3 text-sm">
+                <span className={"rounded-full px-2.5 py-1 text-xs font-medium " +
+                  (user.isAdmin ? "bg-violet-50 text-violet-700" : "bg-slate-100 text-slate-700")}>
+                  {limitLabel}
+                </span>
+                <span className="text-slate-400">{expanded ? "▲" : "▼"}</span>
+              </div>
+            </button>
+            {expanded && (
+              <div className="border-t border-slate-100 px-4 py-4">
+                <div className="mb-3 grid grid-cols-2 gap-3 text-sm sm:grid-cols-4">
+                  <div><span className="text-slate-500">Joined</span><div className="font-medium">{formatDate(user.createdAt)}</div></div>
+                  <div><span className="text-slate-500">Saved</span><div className="font-medium">{user.savedCount}</div></div>
+                  <div><span className="text-slate-500">Activity</span><div className="font-medium">{user.activityCount}</div></div>
+                  <div><span className="text-slate-500">API units</span><div className="font-medium">{user.quotaUnits}</div></div>
+                </div>
+                {channels.length ? (
+                  <div className="overflow-x-auto rounded-lg border border-slate-200">
+                    <table className="min-w-full text-left text-sm">
+                      <thead className="bg-slate-50 text-xs uppercase tracking-wide text-slate-500">
+                        <tr>
+                          <th className="px-3 py-2">Channel</th>
+                          <th className="px-3 py-2">Handle</th>
+                          <th className="px-3 py-2">Analyzed</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-100">
+                        {channels.map(function (ch) {
+                          return (
+                            <tr key={ch.channelId}>
+                              <td className="px-3 py-2 font-medium text-slate-800">{ch.title}</td>
+                              <td className="px-3 py-2 text-slate-600">{ch.handle || "—"}</td>
+                              <td className="px-3 py-2 text-slate-600">{formatDateTime(ch.analyzedAt)}</td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                ) : (
+                  <p className="text-sm text-slate-500">This user hasn&apos;t analyzed any channels yet.</p>
+                )}
+              </div>
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -225,13 +366,27 @@ function AdminDashboard(props) {
   const [activity, setActivity] = useState([]);
   const [quotaLogs, setQuotaLogs] = useState([]);
   const [quotaStats, setQuotaStats] = useState(null);
+  const [maxChannelsPerUser, setMaxChannelsPerUser] = useState(5);
 
   const loadTabData = useCallback(async function (nextTab) {
     setLoading(true);
     setError(null);
     try {
-      if (nextTab === "overview") setDashboard(await apiRequest("/admin/dashboard"));
-      else if (nextTab === "users") setUsers((await apiRequest("/admin/users")).users || []);
+      if (nextTab === "overview") {
+        const data = await apiRequest("/admin/dashboard");
+        setDashboard(data);
+        if (data.settings && data.settings.maxChannelsPerUser) {
+          setMaxChannelsPerUser(data.settings.maxChannelsPerUser);
+        }
+      }
+      else if (nextTab === "users") {
+        const [usersData, settingsData] = await Promise.all([
+          apiRequest("/admin/users"),
+          apiRequest("/admin/settings"),
+        ]);
+        setUsers(usersData.users || []);
+        setMaxChannelsPerUser(settingsData.maxChannelsPerUser || 5);
+      }
       else if (nextTab === "channels") setChannels((await apiRequest("/admin/channels")).channels || []);
       else if (nextTab === "activity") setActivity((await apiRequest("/admin/activity")).activity || []);
       else if (nextTab === "quota") {
@@ -291,6 +446,10 @@ function AdminDashboard(props) {
         {loading && <LoadingState message="Loading admin data…" />}
         {!loading && tab === "overview" && dashboard && (
           <div className="space-y-6">
+            <ChannelLimitSettings
+              value={maxChannelsPerUser}
+              onSaved={function (value) { setMaxChannelsPerUser(value); }}
+            />
             <div className="grid grid-cols-2 gap-3 lg:grid-cols-4 xl:grid-cols-5">
               <AdminStatCard label="Users" value={totals.users} />
               <AdminStatCard label="Cached channels" value={totals.channels} />
@@ -321,13 +480,7 @@ function AdminDashboard(props) {
           </div>
         )}
         {!loading && tab === "users" && (
-          <AdminTable columns={[
-            { key: "email", label: "Email" }, { key: "displayName", label: "Name" },
-            { key: "isAdmin", label: "Admin", render: function (r) { return r.isAdmin ? "Yes" : "No"; } },
-            { key: "savedCount", label: "Saved" }, { key: "activityCount", label: "Activity" },
-            { key: "quotaUnits", label: "API units" },
-            { key: "createdAt", label: "Joined", render: function (r) { return formatDate(r.createdAt); } },
-          ]} rows={users} />
+          <UsersAnalysisPanel users={users} maxChannelsPerUser={maxChannelsPerUser} />
         )}
         {!loading && tab === "channels" && (
           <AdminTable columns={[

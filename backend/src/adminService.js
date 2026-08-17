@@ -1,7 +1,8 @@
 import { pool } from "./db.js";
+import { getAppSettings } from "./settingsService.js";
 
 export async function getDashboardStats() {
-  const [users, channels, videos, saved, activity, quota, quotaToday] = await Promise.all([
+  const [users, channels, videos, saved, activity, quota, quotaToday, settings] = await Promise.all([
     pool.query("SELECT COUNT(*)::int AS count FROM users"),
     pool.query("SELECT COUNT(*)::int AS count FROM channels"),
     pool.query("SELECT COUNT(*)::int AS count FROM videos"),
@@ -18,6 +19,7 @@ export async function getDashboardStats() {
        FROM quota_logs
        WHERE created_at >= CURRENT_DATE`
     ),
+    getAppSettings(),
   ]);
 
   const recentActivity = await pool.query(
@@ -64,6 +66,7 @@ export async function getDashboardStats() {
       cacheHits: cacheHits.rows[0].count,
       apiFetches: apiFetches.rows[0].count,
     },
+    settings,
     recentActivity: recentActivity.rows.map(formatActivityRow),
     recentQuota: recentQuota.rows.map(formatQuotaRow),
   };
@@ -97,14 +100,29 @@ function formatActivityRow(row) {
 export async function listUsers({ limit = 100, offset = 0 } = {}) {
   const { rows } = await pool.query(
     `SELECT u.id, u.email, u.display_name, u.is_admin, u.created_at,
-            COUNT(DISTINCT usc.id)::int AS saved_count,
-            COUNT(DISTINCT ua.id)::int AS activity_count,
-            COALESCE(SUM(ql.units), 0)::int AS quota_units
+            (SELECT COUNT(*)::int FROM user_saved_channels WHERE user_id = u.id) AS saved_count,
+            (SELECT COUNT(*)::int FROM user_analyzed_channels WHERE user_id = u.id) AS analyzed_count,
+            (SELECT COUNT(*)::int FROM user_activity WHERE user_id = u.id) AS activity_count,
+            (SELECT COALESCE(SUM(units), 0)::int FROM quota_logs WHERE user_id = u.id) AS quota_units,
+            COALESCE(
+              (
+                SELECT json_agg(channel_row ORDER BY channel_row->>'analyzedAt' DESC)
+                FROM (
+                  SELECT json_build_object(
+                    'channelId', uac.channel_id,
+                    'title', COALESCE(c.channel_data->>'title', usc.title, uac.channel_id),
+                    'handle', COALESCE(c.handle, ''),
+                    'analyzedAt', uac.first_analyzed_at
+                  ) AS channel_row
+                  FROM user_analyzed_channels uac
+                  LEFT JOIN channels c ON c.channel_id = uac.channel_id
+                  LEFT JOIN user_saved_channels usc ON usc.user_id = uac.user_id AND usc.channel_id = uac.channel_id
+                  WHERE uac.user_id = u.id
+                ) analyzed
+              ),
+              '[]'::json
+            ) AS analyzed_channels
      FROM users u
-     LEFT JOIN user_saved_channels usc ON usc.user_id = u.id
-     LEFT JOIN user_activity ua ON ua.user_id = u.id
-     LEFT JOIN quota_logs ql ON ql.user_id = u.id
-     GROUP BY u.id
      ORDER BY u.created_at DESC
      LIMIT $1 OFFSET $2`,
     [limit, offset]
@@ -116,8 +134,10 @@ export async function listUsers({ limit = 100, offset = 0 } = {}) {
     isAdmin: row.is_admin,
     createdAt: row.created_at,
     savedCount: row.saved_count,
+    analyzedCount: row.analyzed_count,
     activityCount: row.activity_count,
     quotaUnits: row.quota_units,
+    analyzedChannels: Array.isArray(row.analyzed_channels) ? row.analyzed_channels : [],
   }));
 }
 
