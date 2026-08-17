@@ -5,8 +5,12 @@ import { fileURLToPath } from "url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
+const connectionString = process.env.DATABASE_URL || "";
+const isLocalDb = /localhost|127\.0\.0\.1/.test(connectionString);
+
 export const pool = new pg.Pool({
-  connectionString: process.env.DATABASE_URL,
+  connectionString: connectionString,
+  ssl: isLocalDb ? false : { rejectUnauthorized: false },
 });
 
 export async function migrate() {
