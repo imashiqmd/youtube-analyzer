@@ -1084,19 +1084,9 @@ function buildPublishingObservations(data) {
     return ["No uploads in this period."];
   }
 
-  if (formatMix && formatMix.primaryFormat) {
-    const primary = formatMix.primaryFormat;
-    if (primary.dominant) {
-      observations.push(primary.label + " is this creator's main focus (" + primary.pct + "% of uploads).");
-    } else {
-      const mixParts = [];
-      if (formatMix.pctLong > 0) mixParts.push(formatMix.pctLong + "% long-form");
-      if (formatMix.pctShort > 0) mixParts.push(formatMix.pctShort + "% Shorts");
-      if (formatMix.pctLive > 0) mixParts.push(formatMix.pctLive + "% live");
-      if (mixParts.length >= 2) {
-        observations.push("This creator uses a mixed publishing strategy (" + mixParts.join(" · ") + ").");
-      }
-    }
+  if (formatMix) {
+    const focus = describeFormatFocus(formatMix);
+    if (focus) observations.push(focus.observation);
   }
 
   if (previousTotal > 0 && formatMix && previousFormatMix) {
@@ -1112,6 +1102,8 @@ function buildPublishingObservations(data) {
     } else if (
       formatMix.primaryFormat &&
       previousFormatMix.primaryFormat &&
+      formatMix.primaryFormat.dominant &&
+      previousFormatMix.primaryFormat.dominant &&
       formatMix.primaryFormat.id !== previousFormatMix.primaryFormat.id
     ) {
       observations.push(
@@ -1217,22 +1209,17 @@ function formatPublishingPaceLine(longCount, shortCount, liveCount, range) {
 }
 
 function buildPublishingStrategySummary(formatMix, previousFormatMix) {
-  if (!formatMix || !formatMix.primaryFormat) return null;
-  const primary = formatMix.primaryFormat;
-  let summary = "";
-  if (primary.dominant) {
-    summary = "Primarily publishes " + primary.label.toLowerCase() + " (" + primary.pct + "% of uploads)";
-  } else {
-    const mixParts = [];
-    if (formatMix.pctLong > 0) mixParts.push(formatMix.pctLong + "% long-form");
-    if (formatMix.pctShort > 0) mixParts.push(formatMix.pctShort + "% Shorts");
-    if (formatMix.pctLive > 0) mixParts.push(formatMix.pctLive + "% live");
-    summary = "Mixed strategy: " + mixParts.join(" · ");
-  }
+  if (!formatMix) return null;
+  const focus = describeFormatFocus(formatMix);
+  if (!focus) return null;
+  let summary = focus.strategy;
   if (
     previousFormatMix &&
     previousFormatMix.primaryFormat &&
-    previousFormatMix.primaryFormat.id !== primary.id
+    formatMix.primaryFormat &&
+    formatMix.primaryFormat.dominant &&
+    previousFormatMix.primaryFormat.dominant &&
+    previousFormatMix.primaryFormat.id !== formatMix.primaryFormat.id
   ) {
     summary += ". Shifted from " + previousFormatMix.primaryFormat.label.toLowerCase() + " last period";
   }
@@ -1352,23 +1339,72 @@ function computeAverageGap(items) {
   return { meanGapDays: mean };
 }
 
-function getPrimaryFormat(mix, total) {
+const FORMAT_FOCUS_DOMINANT_PCT = 65;
+const FORMAT_FOCUS_MIN_GAP_PCT = 15;
+
+function getTopFormats(mix, total) {
   total = total || ((mix.long || 0) + (mix.short || 0) + (mix.live || 0));
-  if (!total) return null;
-  const formats = [
-    { id: "long", label: "Long-form", count: mix.long || 0 },
-    { id: "short", label: "Shorts", count: mix.short || 0 },
-    { id: "live", label: "Live streams", count: mix.live || 0 },
-  ].sort(function (a, b) { return b.count - a.count; });
+  if (!total) return [];
+  return [
+    { id: "long", label: "Long-form", shortLabel: "long-form", count: mix.long || 0, pct: Math.round(100 * (mix.long || 0) / total) },
+    { id: "short", label: "Shorts", shortLabel: "Shorts", count: mix.short || 0, pct: Math.round(100 * (mix.short || 0) / total) },
+    { id: "live", label: "Live streams", shortLabel: "live streams", count: mix.live || 0, pct: Math.round(100 * (mix.live || 0) / total) },
+  ].filter(function (f) { return f.count > 0; }).sort(function (a, b) { return b.count - a.count; });
+}
+
+function getPrimaryFormat(mix, total) {
+  const formats = getTopFormats(mix, total);
+  if (!formats.length) return null;
   const top = formats[0];
-  if (!top.count) return null;
-  const pct = Math.round(100 * top.count / total);
+  const second = formats[1];
+  const gap = second ? top.pct - second.pct : top.pct;
+  const dominant = top.pct >= FORMAT_FOCUS_DOMINANT_PCT && gap >= FORMAT_FOCUS_MIN_GAP_PCT;
+  const balanced = !dominant && formats.length >= 2 && gap < FORMAT_FOCUS_MIN_GAP_PCT;
   return {
     id: top.id,
     label: top.label,
     count: top.count,
-    pct: pct,
-    dominant: pct >= 50,
+    pct: top.pct,
+    dominant: dominant,
+    balanced: balanced,
+    gapPct: gap,
+    topFormats: formats,
+  };
+}
+
+function describeFormatFocus(formatMix) {
+  if (!formatMix || !formatMix.primaryFormat) return null;
+  const primary = formatMix.primaryFormat;
+  const mixLine = [
+    formatMix.pctLong > 0 ? formatMix.pctLong + "% long-form" : null,
+    formatMix.pctShort > 0 ? formatMix.pctShort + "% Shorts" : null,
+    formatMix.pctLive > 0 ? formatMix.pctLive + "% live" : null,
+  ].filter(Boolean).join(" · ");
+
+  if (primary.dominant) {
+    return {
+      observation: primary.label + " is this creator's main focus (" + primary.pct + "% of uploads).",
+      strategy: "Primarily publishes " + primary.label.toLowerCase() + " (" + primary.pct + "% of uploads)",
+    };
+  }
+
+  const active = (primary.topFormats || []).filter(function (f) { return f.pct >= 10; });
+  if (primary.balanced && active.length >= 2) {
+    if (active.length === 2) {
+      return {
+        observation: "This creator balances both " + active[0].shortLabel + " and " + active[1].shortLabel + " (" + mixLine + ").",
+        strategy: "Balances both " + active[0].shortLabel + " and " + active[1].shortLabel + " (" + mixLine + ")",
+      };
+    }
+    return {
+      observation: "This creator spreads uploads across multiple formats (" + mixLine + ").",
+      strategy: "Mixed strategy across formats (" + mixLine + ")",
+    };
+  }
+
+  return {
+    observation: "This creator leans toward " + primary.label.toLowerCase() + ", but the split is still fairly close (" + mixLine + ").",
+    strategy: "Leans toward " + primary.label.toLowerCase() + " (" + mixLine + ")",
   };
 }
 
