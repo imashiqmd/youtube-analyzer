@@ -44,7 +44,7 @@ const YOUTUBE_API_KEY = "AIzaSyB0-Wl3AsyNO3fZVyRo-K279cN7Qn8I6QM";
 const GEMINI_API_KEY = "__GEMINI_API_KEY__";
 const API_BASE = (function () {
   const configured = "__API_BASE_URL__";
-  if (configured && configured !== "__API_BASE_URL__") return configured.replace(/\/$/, "");
+  if (configured && !configured.startsWith("__")) return configured.replace(/\/$/, "");
   if (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1") {
     return "http://localhost:3001";
   }
@@ -225,7 +225,7 @@ async function removeChannelFromApi(channelId) {
 }
 
 function getGeminiApiKey() {
-  return GEMINI_API_KEY && GEMINI_API_KEY !== "__GEMINI_API_KEY__" ? GEMINI_API_KEY : "";
+  return GEMINI_API_KEY && !GEMINI_API_KEY.startsWith("__") ? GEMINI_API_KEY : "";
 }
 
 function requireGeminiApiKey() {

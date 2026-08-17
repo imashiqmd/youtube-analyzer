@@ -26,7 +26,7 @@ const { useState, useEffect, useCallback } = React;
 
 const API_BASE = (function () {
   const configured = "__API_BASE_URL__";
-  if (configured && configured !== "__API_BASE_URL__") return configured.replace(/\/$/, "");
+  if (configured && !configured.startsWith("__")) return configured.replace(/\/$/, "");
   if (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1") {
     return "http://localhost:3001";
   }
