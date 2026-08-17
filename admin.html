@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Admin — YouTube Channel Analyzer</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js" crossorigin></script>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  html, body { background:#f8fafc; font-family:'Inter', ui-sans-serif, system-ui, sans-serif; }
+  .app-container {
+    width: 100%; max-width: 1600px; margin: 0 auto;
+    padding-left: clamp(1rem, 2.5vw, 2.5rem);
+    padding-right: clamp(1rem, 2.5vw, 2.5rem);
+  }
+</style>
+</head>
+<body class="min-h-screen overflow-x-hidden bg-slate-50 text-slate-900">
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useCallback } = React;
+
+const API_BASE = (function () {
+  const configured = "__API_BASE_URL__";
+  if (configured && configured !== "__API_BASE_URL__") return configured.replace(/\/$/, "");
+  if (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1") {
+    return "http://localhost:3001";
+  }
+  return "";
+})();
+const AUTH_TOKEN_LOCAL_KEY = "ytca-auth-token";
+const AUTH_TOKEN_SESSION_KEY = "ytca-auth-token-session";
+const DISPLAY_TIMEZONE = "Asia/Kolkata";
+
+function getStoredAuthToken() {
+  return localStorage.getItem(AUTH_TOKEN_LOCAL_KEY) || sessionStorage.getItem(AUTH_TOKEN_SESSION_KEY) || "";
+}
+function storeAuthToken(token, rememberMe) {
+  localStorage.removeItem(AUTH_TOKEN_LOCAL_KEY);
+  sessionStorage.removeItem(AUTH_TOKEN_SESSION_KEY);
+  if (!token) return;
+  if (rememberMe) localStorage.setItem(AUTH_TOKEN_LOCAL_KEY, token);
+  else sessionStorage.setItem(AUTH_TOKEN_SESSION_KEY, token);
+}
+function clearAuthToken() {
+  localStorage.removeItem(AUTH_TOKEN_LOCAL_KEY);
+  sessionStorage.removeItem(AUTH_TOKEN_SESSION_KEY);
+}
+async function apiRequest(path, options) {
+  const opts = options || {};
+  const headers = Object.assign({ "Content-Type": "application/json" }, opts.headers || {});
+  const token = getStoredAuthToken();
+  if (token) headers.Authorization = "Bearer " + token;
+  if (!API_BASE) throw new Error("API is not configured for this deployment.");
+  const res = await fetch(API_BASE + path, {
+    method: opts.method || "GET",
+    headers: headers,
+    body: opts.body ? JSON.stringify(opts.body) : undefined,
+  });
+  const data = await res.json().catch(function () { return {}; });
+  if (!res.ok) throw new Error(data.error || ("Request failed (" + res.status + ")"));
+  return data;
+}
+function formatApiError(err) {
+  const msg = err && err.message ? err.message : String(err);
+  if (msg === "Failed to fetch" || msg.indexOf("NetworkError") >= 0) {
+    return "Cannot reach the server. Make sure the backend API is running on " + API_BASE + ".";
+  }
+  return msg;
+}
+function formatDate(iso) {
+  if (!iso) return "—";
+  return new Date(iso).toLocaleDateString("en-IN", { timeZone: DISPLAY_TIMEZONE, year: "numeric", month: "short", day: "numeric" });
+}
+function formatDateTime(iso) {
+  if (!iso) return "—";
+  return new Date(iso).toLocaleString("en-IN", {
+    timeZone: DISPLAY_TIMEZONE,
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+function formatCellValue(val) {
+  if (val == null || val === "") return "—";
+  if (typeof val === "object") {
+    try { return JSON.stringify(val); } catch (e) { return "—"; }
+  }
+  return val;
+}
+
+function Spinner(props) {
+  return (
+    <svg className={"animate-spin " + (props.className || "h-4 w-4")} viewBox="0 0 24 24" fill="none">
+      <circle className="opacity-20" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+      <path className="opacity-80" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"></path>
+    </svg>
+  );
+}
+function LoadingState(props) {
+  return (
+    <div className="flex flex-col items-center justify-center rounded-2xl border border-slate-200 bg-white px-6 py-20 text-center shadow-sm">
+      <Spinner className="h-6 w-6 text-slate-900" />
+      <p className="mt-4 text-sm font-medium text-slate-700">{props.message}</p>
+    </div>
+  );
+}
+function AdminStatCard(props) {
+  return (
+    <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+      <p className="text-xs font-medium uppercase tracking-wide text-slate-500">{props.label}</p>
+      <p className="mt-2 text-2xl font-bold text-slate-900">{props.value}</p>
+      {props.note && <p className="mt-1 text-xs text-slate-400">{props.note}</p>}
+    </div>
+  );
+}
+function AdminTable(props) {
+  if (!props.rows || !props.rows.length) return <p className="text-sm text-slate-500">No records yet.</p>;
+  return (
+    <div className="overflow-x-auto rounded-xl border border-slate-200">
+      <table className="min-w-full divide-y divide-slate-200 text-left text-sm">
+        <thead className="bg-slate-50">
+          <tr>{props.columns.map(function (col) {
+            return <th key={col.key} className="px-4 py-3 text-xs font-semibold uppercase tracking-wide text-slate-500">{col.label}</th>;
+          })}</tr>
+        </thead>
+        <tbody className="divide-y divide-slate-100 bg-white">
+          {props.rows.map(function (row, i) {
+            return (
+              <tr key={row.id || i} className="hover:bg-slate-50">
+                {props.columns.map(function (col) {
+                  let val = typeof col.render === "function" ? col.render(row) : row[col.key];
+                  return <td key={col.key} className="px-4 py-3 text-slate-700">{formatCellValue(val)}</td>;
+                })}
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function AdminLoginScreen(props) {
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [rememberMe, setRememberMe] = useState(true);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+
+  const submit = async function (e) {
+    e.preventDefault();
+    setError(null);
+    setLoading(true);
+    try {
+      const result = await apiRequest("/auth/login", {
+        method: "POST",
+        body: { email: email.trim(), password: password, rememberMe: rememberMe },
+      });
+      if (!result.user || !result.user.isAdmin) {
+        clearAuthToken();
+        throw new Error("This account does not have admin access.");
+      }
+      storeAuthToken(result.token, result.rememberMe);
+      props.onAuthSuccess(result.user);
+    } catch (err) {
+      setError(formatApiError(err));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="flex min-h-screen items-center justify-center px-5 py-10">
+      <div className="w-full max-w-md rounded-2xl border border-slate-200 bg-white p-8 shadow-sm">
+        <div className="mb-6 text-center">
+          <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-2xl bg-violet-600 text-lg font-bold text-white">A</div>
+          <h1 className="text-xl font-bold text-slate-900">Admin Panel</h1>
+          <p className="mt-1 text-sm text-slate-500">Sign in with an admin account</p>
+        </div>
+        <form className="space-y-4" onSubmit={submit}>
+          <div>
+            <label className="mb-1.5 block text-sm font-medium text-slate-700">Email</label>
+            <input type="email" required autoComplete="email" value={email} onChange={function (e) { setEmail(e.target.value); }}
+              className="w-full rounded-xl border border-slate-200 px-4 py-3 text-sm outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-200" />
+          </div>
+          <div>
+            <label className="mb-1.5 block text-sm font-medium text-slate-700">Password</label>
+            <input type="password" required autoComplete="current-password" value={password} onChange={function (e) { setPassword(e.target.value); }}
+              className="w-full rounded-xl border border-slate-200 px-4 py-3 text-sm outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-200" />
+          </div>
+          <label className="flex cursor-pointer items-center gap-2.5 text-sm text-slate-600">
+            <input type="checkbox" checked={rememberMe} onChange={function (e) { setRememberMe(e.target.checked); }}
+              className="h-4 w-4 rounded border-slate-300" />
+            Keep me signed in
+          </label>
+          {error && <div className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-600">{error}</div>}
+          <button type="submit" disabled={loading}
+            className="inline-flex w-full items-center justify-center gap-2 rounded-xl bg-slate-900 px-5 py-3 text-sm font-semibold text-white hover:bg-slate-800 disabled:opacity-50">
+            {loading && <Spinner className="h-4 w-4 text-white" />}
+            {loading ? "Signing in…" : "Sign in"}
+          </button>
+        </form>
+        <p className="mt-6 text-center text-sm text-slate-500">
+          <a href="/" className="font-medium text-slate-700 hover:text-slate-900">← Back to main app</a>
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function AdminDashboard(props) {
+  const [tab, setTab] = useState("overview");
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [dashboard, setDashboard] = useState(null);
+  const [users, setUsers] = useState([]);
+  const [channels, setChannels] = useState([]);
+  const [activity, setActivity] = useState([]);
+  const [quotaLogs, setQuotaLogs] = useState([]);
+  const [quotaStats, setQuotaStats] = useState(null);
+
+  const loadTabData = useCallback(async function (nextTab) {
+    setLoading(true);
+    setError(null);
+    try {
+      if (nextTab === "overview") setDashboard(await apiRequest("/admin/dashboard"));
+      else if (nextTab === "users") setUsers((await apiRequest("/admin/users")).users || []);
+      else if (nextTab === "channels") setChannels((await apiRequest("/admin/channels")).channels || []);
+      else if (nextTab === "activity") setActivity((await apiRequest("/admin/activity")).activity || []);
+      else if (nextTab === "quota") {
+        const [logsData, statsData] = await Promise.all([
+          apiRequest("/admin/quota-logs"),
+          apiRequest("/admin/quota-stats"),
+        ]);
+        setQuotaLogs(logsData.logs || []);
+        setQuotaStats(statsData);
+      }
+    } catch (e) {
+      setError(e.message || String(e));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(function () { loadTabData(tab); }, [tab, loadTabData]);
+
+  const tabs = [
+    { id: "overview", label: "Overview" },
+    { id: "users", label: "Users" },
+    { id: "channels", label: "Channels" },
+    { id: "activity", label: "Activity" },
+    { id: "quota", label: "API Usage" },
+  ];
+  const totals = dashboard && dashboard.totals ? dashboard.totals : {};
+
+  return (
+    <div className="min-h-screen bg-slate-50">
+      <header className="sticky top-0 z-10 border-b border-slate-200 bg-white/90 backdrop-blur">
+        <div className="app-container flex flex-col gap-3 py-3 sm:flex-row sm:items-center sm:justify-between sm:py-4">
+          <div>
+            <div className="text-base font-bold text-slate-900">Admin Panel</div>
+            <div className="text-xs text-slate-500">Signed in as {props.user.displayName} ({props.user.email})</div>
+          </div>
+          <div className="flex gap-2">
+            <a href="/" className="rounded-xl border border-slate-200 bg-white px-4 py-2 text-sm font-semibold text-slate-700 hover:border-slate-300">Main app</a>
+            <button type="button" onClick={props.onLogout}
+              className="rounded-xl border border-slate-200 bg-white px-4 py-2 text-sm font-semibold text-slate-700 hover:border-slate-300">Sign out</button>
+          </div>
+        </div>
+      </header>
+      <main className="app-container py-5 sm:py-6 lg:py-8">
+        <div className="mb-6 flex flex-wrap gap-2">
+          {tabs.map(function (t) {
+            return (
+              <button key={t.id} type="button" onClick={function () { setTab(t.id); }}
+                className={"rounded-xl px-4 py-2 text-sm font-semibold transition " +
+                  (tab === t.id ? "bg-slate-900 text-white" : "border border-slate-200 bg-white text-slate-600 hover:border-slate-300")}>
+                {t.label}
+              </button>
+            );
+          })}
+        </div>
+        {error && <div className="mb-6 rounded-2xl border border-rose-200 bg-rose-50 px-6 py-4 text-sm text-rose-600">{error}</div>}
+        {loading && <LoadingState message="Loading admin data…" />}
+        {!loading && tab === "overview" && dashboard && (
+          <div className="space-y-6">
+            <div className="grid grid-cols-2 gap-3 lg:grid-cols-4 xl:grid-cols-5">
+              <AdminStatCard label="Users" value={totals.users} />
+              <AdminStatCard label="Cached channels" value={totals.channels} />
+              <AdminStatCard label="Videos stored" value={totals.videos} />
+              <AdminStatCard label="Saved channels" value={totals.savedChannels} />
+              <AdminStatCard label="Activity events" value={totals.activityEvents} />
+              <AdminStatCard label="API units today" value={totals.todayUnits} note={totals.todayCalls + " calls today"} />
+              <AdminStatCard label="API units used" value={totals.quotaUnitsUsed} note={totals.quotaApiCalls + " calls all time"} />
+              <AdminStatCard label="Cache hits" value={totals.cacheHits} />
+              <AdminStatCard label="API fetches" value={totals.apiFetches} />
+            </div>
+            <div>
+              <h2 className="mb-3 text-sm font-bold uppercase tracking-wide text-slate-500">Recent activity</h2>
+              <AdminTable columns={[
+                { key: "createdAt", label: "Time", render: function (r) { return formatDateTime(r.createdAt); } },
+                { key: "userEmail", label: "User" }, { key: "action", label: "Action" }, { key: "channelId", label: "Channel" },
+                { key: "metadata", label: "Details", render: function (r) { return r.metadata ? JSON.stringify(r.metadata) : "—"; } },
+              ]} rows={dashboard.recentActivity || []} />
+            </div>
+            <div>
+              <h2 className="mb-3 text-sm font-bold uppercase tracking-wide text-slate-500">Recent API usage</h2>
+              <AdminTable columns={[
+                { key: "createdAt", label: "Time", render: function (r) { return formatDateTime(r.createdAt); } },
+                { key: "userEmail", label: "User" }, { key: "endpoint", label: "Endpoint" }, { key: "units", label: "Units" },
+                { key: "channelId", label: "Channel" }, { key: "requestSource", label: "Source" },
+              ]} rows={dashboard.recentQuota || []} />
+            </div>
+          </div>
+        )}
+        {!loading && tab === "users" && (
+          <AdminTable columns={[
+            { key: "email", label: "Email" }, { key: "displayName", label: "Name" },
+            { key: "isAdmin", label: "Admin", render: function (r) { return r.isAdmin ? "Yes" : "No"; } },
+            { key: "savedCount", label: "Saved" }, { key: "activityCount", label: "Activity" },
+            { key: "quotaUnits", label: "API units" },
+            { key: "createdAt", label: "Joined", render: function (r) { return formatDate(r.createdAt); } },
+          ]} rows={users} />
+        )}
+        {!loading && tab === "channels" && (
+          <AdminTable columns={[
+            { key: "title", label: "Channel" }, { key: "handle", label: "Handle" }, { key: "videoCount", label: "Videos" },
+            { key: "savedByUsers", label: "Saved by" },
+            { key: "lastSyncedAt", label: "Last synced", render: function (r) { return formatDateTime(r.lastSyncedAt); } },
+          ]} rows={channels} />
+        )}
+        {!loading && tab === "activity" && (
+          <AdminTable columns={[
+            { key: "createdAt", label: "Time", render: function (r) { return formatDateTime(r.createdAt); } },
+            { key: "userEmail", label: "User" }, { key: "action", label: "Action" }, { key: "channelId", label: "Channel" },
+            { key: "metadata", label: "Details", render: function (r) { return r.metadata ? JSON.stringify(r.metadata) : "—"; } },
+          ]} rows={activity} />
+        )}
+        {!loading && tab === "quota" && (
+          <div className="space-y-6">
+            {quotaStats && (
+              <>
+                <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+                  <AdminStatCard label="Today" value={quotaStats.totals.todayUnits} note={quotaStats.totals.todayCalls + " calls"} />
+                  <AdminStatCard label="All time" value={quotaStats.totals.allTimeUnits} note={quotaStats.totals.allTimeCalls + " calls"} />
+                  <AdminStatCard label="Users with API usage" value={quotaStats.totals.uniqueUsers} />
+                </div>
+                <div>
+                  <h2 className="mb-3 text-sm font-bold uppercase tracking-wide text-slate-500">By endpoint</h2>
+                  <AdminTable columns={[{ key: "endpoint", label: "Endpoint" }, { key: "calls", label: "Calls" }, { key: "units", label: "Units" }]} rows={quotaStats.byEndpoint || []} />
+                </div>
+                <div>
+                  <h2 className="mb-3 text-sm font-bold uppercase tracking-wide text-slate-500">By user</h2>
+                  <AdminTable columns={[{ key: "email", label: "User" }, { key: "calls", label: "Calls" }, { key: "units", label: "Units" }]} rows={quotaStats.byUser || []} />
+                </div>
+                <div>
+                  <h2 className="mb-3 text-sm font-bold uppercase tracking-wide text-slate-500">Last 30 days</h2>
+                  <AdminTable columns={[
+                    { key: "day", label: "Day", render: function (r) { return formatDate(r.day); } },
+                    { key: "calls", label: "Calls" }, { key: "units", label: "Units" },
+                  ]} rows={quotaStats.byDay || []} />
+                </div>
+              </>
+            )}
+            <div>
+              <h2 className="mb-3 text-sm font-bold uppercase tracking-wide text-slate-500">Recent API calls</h2>
+              <AdminTable columns={[
+                { key: "createdAt", label: "Time", render: function (r) { return formatDateTime(r.createdAt); } },
+                { key: "userEmail", label: "User" }, { key: "endpoint", label: "Endpoint" }, { key: "units", label: "Units" },
+                { key: "channelId", label: "Channel" }, { key: "requestSource", label: "Source" },
+              ]} rows={quotaLogs} />
+            </div>
+          </div>
+        )}
+      </main>
+    </div>
+  );
+}
+
+function App() {
+  const [user, setUser] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(function () {
+    if (!API_BASE) { setLoading(false); return; }
+    const token = getStoredAuthToken();
+    if (!token) { setLoading(false); return; }
+    apiRequest("/auth/me")
+      .then(function (data) {
+        if (!data.user || !data.user.isAdmin) {
+          clearAuthToken();
+          setUser(null);
+        } else {
+          setUser(data.user);
+        }
+      })
+      .catch(function () { clearAuthToken(); })
+      .finally(function () { setLoading(false); });
+  }, []);
+
+  const handleLogout = async function () {
+    try { await apiRequest("/auth/logout", { method: "POST" }); } catch (e) { /* ignore */ }
+    clearAuthToken();
+    setUser(null);
+  };
+
+  if (!API_BASE) {
+    return (
+      <div className="flex min-h-screen items-center justify-center p-6 text-center text-sm text-slate-600">
+        Admin panel requires a configured API backend.
+      </div>
+    );
+  }
+  if (loading) return <LoadingState message="Checking admin session…" />;
+  if (!user) return <AdminLoginScreen onAuthSuccess={setUser} />;
+  return <AdminDashboard user={user} onLogout={handleLogout} />;
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>

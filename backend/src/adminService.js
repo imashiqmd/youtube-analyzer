@@ -1,0 +1,238 @@
+import { pool } from "./db.js";
+
+export async function getDashboardStats() {
+  const [users, channels, videos, saved, activity, quota, quotaToday] = await Promise.all([
+    pool.query("SELECT COUNT(*)::int AS count FROM users"),
+    pool.query("SELECT COUNT(*)::int AS count FROM channels"),
+    pool.query("SELECT COUNT(*)::int AS count FROM videos"),
+    pool.query("SELECT COUNT(*)::int AS count FROM user_saved_channels"),
+    pool.query("SELECT COUNT(*)::int AS count FROM user_activity"),
+    pool.query(
+      `SELECT COALESCE(SUM(units), 0)::int AS total_units,
+              COUNT(*)::int AS total_calls
+       FROM quota_logs`
+    ),
+    pool.query(
+      `SELECT COALESCE(SUM(units), 0)::int AS units,
+              COUNT(*)::int AS calls
+       FROM quota_logs
+       WHERE created_at >= CURRENT_DATE`
+    ),
+  ]);
+
+  const recentActivity = await pool.query(
+    `SELECT ua.id, ua.action, ua.channel_id, ua.metadata, ua.created_at,
+            u.email, u.display_name
+     FROM user_activity ua
+     JOIN users u ON u.id = ua.user_id
+     ORDER BY ua.created_at DESC
+     LIMIT 50`
+  );
+
+  const recentQuota = await pool.query(
+    `SELECT ql.id, ql.endpoint, ql.units, ql.channel_id, ql.request_source, ql.created_at,
+            u.email AS user_email, u.display_name AS user_name
+     FROM quota_logs ql
+     LEFT JOIN users u ON u.id = ql.user_id
+     ORDER BY ql.created_at DESC
+     LIMIT 50`
+  );
+
+  const cacheHits = await pool.query(
+    `SELECT COUNT(*)::int AS count
+     FROM user_activity
+     WHERE action = 'analyze_channel' AND metadata->>'source' = 'cache'`
+  );
+
+  const apiFetches = await pool.query(
+    `SELECT COUNT(*)::int AS count
+     FROM user_activity
+     WHERE action = 'analyze_channel' AND metadata->>'source' = 'api'`
+  );
+
+  return {
+    totals: {
+      users: users.rows[0].count,
+      channels: channels.rows[0].count,
+      videos: videos.rows[0].count,
+      savedChannels: saved.rows[0].count,
+      activityEvents: activity.rows[0].count,
+      quotaUnitsUsed: quota.rows[0].total_units,
+      quotaApiCalls: quota.rows[0].total_calls,
+      todayUnits: quotaToday.rows[0].units,
+      todayCalls: quotaToday.rows[0].calls,
+      cacheHits: cacheHits.rows[0].count,
+      apiFetches: apiFetches.rows[0].count,
+    },
+    recentActivity: recentActivity.rows.map(formatActivityRow),
+    recentQuota: recentQuota.rows.map(formatQuotaRow),
+  };
+}
+
+function formatQuotaRow(row) {
+  return {
+    id: row.id,
+    endpoint: row.endpoint,
+    units: row.units,
+    channelId: row.channel_id,
+    requestSource: row.request_source,
+    createdAt: row.created_at,
+    userEmail: row.user_email,
+    userName: row.user_name,
+  };
+}
+
+function formatActivityRow(row) {
+  return {
+    id: row.id,
+    action: row.action,
+    channelId: row.channel_id,
+    metadata: row.metadata,
+    createdAt: row.created_at,
+    userEmail: row.email,
+    userName: row.display_name,
+  };
+}
+
+export async function listUsers({ limit = 100, offset = 0 } = {}) {
+  const { rows } = await pool.query(
+    `SELECT u.id, u.email, u.display_name, u.is_admin, u.created_at,
+            COUNT(DISTINCT usc.id)::int AS saved_count,
+            COUNT(DISTINCT ua.id)::int AS activity_count,
+            COALESCE(SUM(ql.units), 0)::int AS quota_units
+     FROM users u
+     LEFT JOIN user_saved_channels usc ON usc.user_id = u.id
+     LEFT JOIN user_activity ua ON ua.user_id = u.id
+     LEFT JOIN quota_logs ql ON ql.user_id = u.id
+     GROUP BY u.id
+     ORDER BY u.created_at DESC
+     LIMIT $1 OFFSET $2`,
+    [limit, offset]
+  );
+  return rows.map((row) => ({
+    id: row.id,
+    email: row.email,
+    displayName: row.display_name,
+    isAdmin: row.is_admin,
+    createdAt: row.created_at,
+    savedCount: row.saved_count,
+    activityCount: row.activity_count,
+    quotaUnits: row.quota_units,
+  }));
+}
+
+export async function listChannels({ limit = 100, offset = 0 } = {}) {
+  const { rows } = await pool.query(
+    `SELECT c.channel_id, c.handle, c.last_synced_at, c.created_at, c.updated_at,
+            c.channel_data->>'title' AS title,
+            jsonb_array_length(c.video_ids) AS video_count,
+            COUNT(DISTINCT usc.user_id)::int AS saved_by_users
+     FROM channels c
+     LEFT JOIN user_saved_channels usc ON usc.channel_id = c.channel_id
+     GROUP BY c.channel_id, c.handle, c.last_synced_at, c.created_at, c.updated_at, c.channel_data, c.video_ids
+     ORDER BY c.last_synced_at DESC
+     LIMIT $1 OFFSET $2`,
+    [limit, offset]
+  );
+  return rows.map((row) => ({
+    channelId: row.channel_id,
+    handle: row.handle,
+    title: row.title,
+    videoCount: Number(row.video_count) || 0,
+    lastSyncedAt: row.last_synced_at,
+    createdAt: row.created_at,
+    savedByUsers: row.saved_by_users,
+  }));
+}
+
+export async function listActivity({ limit = 100, offset = 0 } = {}) {
+  const { rows } = await pool.query(
+    `SELECT ua.id, ua.action, ua.channel_id, ua.metadata, ua.created_at,
+            u.email, u.display_name
+     FROM user_activity ua
+     JOIN users u ON u.id = ua.user_id
+     ORDER BY ua.created_at DESC
+     LIMIT $1 OFFSET $2`,
+    [limit, offset]
+  );
+  return rows.map(formatActivityRow);
+}
+
+export async function listQuotaLogs({ limit = 100, offset = 0 } = {}) {
+  const { rows } = await pool.query(
+    `SELECT ql.id, ql.endpoint, ql.units, ql.channel_id, ql.request_source, ql.created_at,
+            u.email AS user_email, u.display_name AS user_name
+     FROM quota_logs ql
+     LEFT JOIN users u ON u.id = ql.user_id
+     ORDER BY ql.created_at DESC
+     LIMIT $1 OFFSET $2`,
+    [limit, offset]
+  );
+  return rows.map(formatQuotaRow);
+}
+
+export async function getQuotaStats() {
+  const [totals, today, byEndpoint, byUser, byDay] = await Promise.all([
+    pool.query(
+      `SELECT COALESCE(SUM(units), 0)::int AS total_units,
+              COUNT(*)::int AS total_calls,
+              COUNT(DISTINCT user_id)::int AS unique_users
+       FROM quota_logs`
+    ),
+    pool.query(
+      `SELECT COALESCE(SUM(units), 0)::int AS units,
+              COUNT(*)::int AS calls
+       FROM quota_logs
+       WHERE created_at >= CURRENT_DATE`
+    ),
+    pool.query(
+      `SELECT endpoint,
+              COUNT(*)::int AS calls,
+              COALESCE(SUM(units), 0)::int AS units
+       FROM quota_logs
+       GROUP BY endpoint
+       ORDER BY units DESC, calls DESC`
+    ),
+    pool.query(
+      `SELECT u.email, u.display_name,
+              COUNT(ql.id)::int AS calls,
+              COALESCE(SUM(ql.units), 0)::int AS units
+       FROM quota_logs ql
+       JOIN users u ON u.id = ql.user_id
+       GROUP BY u.id, u.email, u.display_name
+       ORDER BY units DESC
+       LIMIT 20`
+    ),
+    pool.query(
+      `SELECT DATE(created_at) AS day,
+              COUNT(*)::int AS calls,
+              COALESCE(SUM(units), 0)::int AS units
+       FROM quota_logs
+       WHERE created_at >= CURRENT_DATE - INTERVAL '30 days'
+       GROUP BY DATE(created_at)
+       ORDER BY day DESC`
+    ),
+  ]);
+
+  return {
+    totals: {
+      allTimeUnits: totals.rows[0].total_units,
+      allTimeCalls: totals.rows[0].total_calls,
+      uniqueUsers: totals.rows[0].unique_users,
+      todayUnits: today.rows[0].units,
+      todayCalls: today.rows[0].calls,
+    },
+    byEndpoint: byEndpoint.rows,
+    byUser: byUser.rows.map((row) => ({
+      email: row.email,
+      displayName: row.display_name,
+      calls: row.calls,
+      units: row.units,
+    })),
+    byDay: byDay.rows.map((row) => ({
+      day: row.day,
+      calls: row.calls,
+      units: row.units,
+    })),
+  };
+}

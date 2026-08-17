@@ -1,8 +1,5 @@
-const FRESH_MS = 24 * 60 * 60 * 1000;
-
 export function isCacheFresh(lastSyncedAt) {
-  if (!lastSyncedAt) return false;
-  return Date.now() - new Date(lastSyncedAt).getTime() < FRESH_MS;
+  return Boolean(lastSyncedAt);
 }
 
 export function normalizeHandle(raw) {

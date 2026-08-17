@@ -17,9 +17,20 @@
   .line-clamp-2 { display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
   ::-webkit-scrollbar { width:8px; height:8px; }
   ::-webkit-scrollbar-thumb { background:#e2e8f0; border-radius:9999px; }
+  .app-container {
+    width: 100%;
+    max-width: 1600px;
+    margin-left: auto;
+    margin-right: auto;
+    padding-left: clamp(1rem, 2.5vw, 2.5rem);
+    padding-right: clamp(1rem, 2.5vw, 2.5rem);
+  }
+  @media (max-width: 639px) {
+    .app-container { padding-left: 1rem; padding-right: 1rem; }
+  }
 </style>
 </head>
-<body class="min-h-screen bg-slate-50 text-slate-900">
+<body class="min-h-screen overflow-x-hidden bg-slate-50 text-slate-900">
 <div id="root"></div>
 
 <script type="text/babel" data-presets="react">
@@ -31,6 +42,187 @@ const useEffect = React.useEffect;
 
 const YOUTUBE_API_KEY = "AIzaSyB0-Wl3AsyNO3fZVyRo-K279cN7Qn8I6QM";
 const GEMINI_API_KEY = "__GEMINI_API_KEY__";
+const API_BASE = (function () {
+  const configured = "__API_BASE_URL__";
+  if (configured && configured !== "__API_BASE_URL__") return configured.replace(/\/$/, "");
+  if (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1") {
+    return "http://localhost:3001";
+  }
+  return "";
+})();
+const AUTH_TOKEN_LOCAL_KEY = "ytca-auth-token";
+const AUTH_TOKEN_SESSION_KEY = "ytca-auth-token-session";
+const AUTH_USER_CACHE_KEY = "ytca-auth-user";
+
+function getStoredAuthToken() {
+  return localStorage.getItem(AUTH_TOKEN_LOCAL_KEY) || sessionStorage.getItem(AUTH_TOKEN_SESSION_KEY) || "";
+}
+
+function storeAuthToken(token, rememberMe) {
+  localStorage.removeItem(AUTH_TOKEN_LOCAL_KEY);
+  sessionStorage.removeItem(AUTH_TOKEN_SESSION_KEY);
+  if (!token) return;
+  if (rememberMe) localStorage.setItem(AUTH_TOKEN_LOCAL_KEY, token);
+  else sessionStorage.setItem(AUTH_TOKEN_SESSION_KEY, token);
+}
+
+function clearAuthToken() {
+  localStorage.removeItem(AUTH_TOKEN_LOCAL_KEY);
+  sessionStorage.removeItem(AUTH_TOKEN_SESSION_KEY);
+  localStorage.removeItem(AUTH_USER_CACHE_KEY);
+}
+
+function loadCachedAuthUser() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(AUTH_USER_CACHE_KEY) || "null");
+    return parsed && parsed.id ? parsed : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function persistCachedAuthUser(user) {
+  if (!user) return;
+  try {
+    localStorage.setItem(AUTH_USER_CACHE_KEY, JSON.stringify(user));
+  } catch (e) { /* ignore */ }
+}
+
+async function apiRequest(path, options) {
+  const opts = options || {};
+  const headers = Object.assign({ "Content-Type": "application/json" }, opts.headers || {});
+  const token = getStoredAuthToken();
+  if (token) headers.Authorization = "Bearer " + token;
+  if (!API_BASE) throw new Error("Sign-in is not available on this deployment.");
+  const res = await fetch(API_BASE + path, {
+    method: opts.method || "GET",
+    headers: headers,
+    body: opts.body ? JSON.stringify(opts.body) : undefined,
+  });
+  const data = await res.json().catch(function () { return {}; });
+  if (!res.ok) throw new Error(data.error || ("Request failed (" + res.status + ")"));
+  return data;
+}
+
+function formatApiError(err) {
+  const msg = err && err.message ? err.message : String(err);
+  if (msg === "Failed to fetch" || msg.indexOf("NetworkError") >= 0 || msg.indexOf("Load failed") >= 0) {
+    return "Cannot reach the server. Make sure the backend API is running on " + API_BASE + ".";
+  }
+  return msg;
+}
+
+function apiResponseToCacheEntry(data) {
+  return {
+    version: CACHE_VERSION,
+    channelId: data.channelId,
+    lastAnalyzedAt: data.lastSyncedAt,
+    lastSyncedAt: data.lastSyncedAt,
+    channel: data.channel,
+    videoIds: data.videoIds || (data.rawVideos || []).map(function (v) { return v.id; }),
+    rawVideos: data.rawVideos || [],
+    topicClassifications: {},
+  };
+}
+
+async function mergeLocalTopicClassifications(entry) {
+  try {
+    const local = await loadChannelCache(entry.channelId);
+    if (local && local.topicClassifications) {
+      entry.topicClassifications = Object.assign({}, local.topicClassifications, entry.topicClassifications || {});
+    }
+  } catch (e) { /* keep server data */ }
+  return entry;
+}
+
+async function analyzeChannelViaApi(handle, onProgress, options) {
+  const opts = options || {};
+  if (opts.channelId) {
+    if (onProgress) onProgress("Loading saved channel…");
+    try {
+      const data = await apiRequest("/channels/" + encodeURIComponent(opts.channelId));
+      if (onProgress) onProgress("Loaded from saved data…");
+      return { entry: apiResponseToCacheEntry(data) };
+    } catch (e) {
+      if (e && e.message && e.message.indexOf("not found") < 0) throw e;
+    }
+  }
+  if (onProgress) onProgress("Checking shared database cache…");
+  const data = await apiRequest("/analyze", { method: "POST", body: { handle: handle } });
+  if (onProgress) {
+    onProgress(data.source === "cache"
+      ? "Loaded from saved data…"
+      : "Fetching channel data…");
+  }
+  return {
+    entry: apiResponseToCacheEntry(data),
+  };
+}
+
+async function fetchSavedChannelsFromApi() {
+  const data = await apiRequest("/me/saved-channels");
+  return data.channels || [];
+}
+
+function channelSavePayload(channel) {
+  const id = channel.id || channel.channelId;
+  const query = channel.query
+    || (channel.customUrl ? "https://www.youtube.com/" + channel.customUrl.replace(/^\//, "") : null)
+    || ("https://www.youtube.com/channel/" + id);
+  return {
+    id: id,
+    title: channel.title || "Saved channel",
+    thumbnail: channel.thumbnail || "",
+    query: query,
+  };
+}
+
+async function saveChannelToApi(channel) {
+  const payload = channelSavePayload(channel);
+  const data = await apiRequest("/me/saved-channels", {
+    method: "POST",
+    body: {
+      channelId: payload.id,
+      title: payload.title,
+      thumbnail: payload.thumbnail,
+      query: payload.query,
+    },
+  });
+  return data.channels || [];
+}
+
+async function migrateLocalFavoritesToApi(existingChannels) {
+  if (!API_BASE || !getStoredAuthToken()) return existingChannels || [];
+  const local = loadFavorites();
+  if (!local.length) return existingChannels || [];
+
+  let channels = existingChannels || [];
+  const existingIds = {};
+  channels.forEach(function (c) { existingIds[c.id] = true; });
+
+  for (let i = 0; i < local.length; i++) {
+    const fav = local[i];
+    if (!fav || !fav.id || existingIds[fav.id]) continue;
+    try {
+      channels = await saveChannelToApi(fav);
+      existingIds[fav.id] = true;
+    } catch (e) {
+      console.warn("Could not migrate saved channel:", fav.id, e);
+    }
+  }
+
+  if (channels.length) {
+    try { localStorage.removeItem(FAVORITES_KEY); } catch (e) { /* ignore */ }
+  }
+  return channels;
+}
+
+async function removeChannelFromApi(channelId) {
+  const data = await apiRequest("/me/saved-channels/" + encodeURIComponent(channelId), {
+    method: "DELETE",
+  });
+  return data.channels || [];
+}
 
 function getGeminiApiKey() {
   return GEMINI_API_KEY && GEMINI_API_KEY !== "__GEMINI_API_KEY__" ? GEMINI_API_KEY : "";
@@ -57,13 +249,13 @@ const TOPIC_CLASSIFICATION_VERSION = 1;
 const TOPIC_OTHER_MAX_SHARE = 0.2;
 const MAX_PLAYLIST_PAGES = null; // null = fetch entire upload history
 const FAVORITES_KEY = "ytca-favorites";
+const SAVED_CHANNELS_CACHE_KEY = "ytca-saved-channels-cache";
 const CHANNEL_SYNC_KEY = "ytca-channel-sync";
 const CHANNEL_DB_NAME = "ytca-channel-db";
 const CHANNEL_DB_VERSION = 2;
 const CHANNEL_STORE = "channels";
 const VIDEO_STORE = "videos";
 const CACHE_VERSION = 2;
-const CACHE_FRESH_MS = 30 * 60 * 1000;
 const memoryChannelCache = new Map();
 const ACTIVITY_PERIODS = [
   { label: "1 week", days: 7 },
@@ -72,7 +264,7 @@ const ACTIVITY_PERIODS = [
   { label: "6 months", days: 182 },
   { label: "1 year", days: 365 },
 ];
-const DEFAULT_ACTIVITY_RANGE = { type: "preset", days: 182 };
+const DEFAULT_ACTIVITY_RANGE = { type: "preset", days: 30 };
 const DISPLAY_TIMEZONE = "Asia/Kolkata";
 const VISIBLE_FAVORITES = 4;
 
@@ -96,6 +288,41 @@ function loadFavorites() {
 
 function persistFavorites(list) {
   localStorage.setItem(FAVORITES_KEY, JSON.stringify(list));
+}
+
+function loadSavedChannelsCache() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(SAVED_CHANNELS_CACHE_KEY) || "[]");
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+function persistSavedChannelsCache(channels) {
+  try {
+    localStorage.setItem(SAVED_CHANNELS_CACHE_KEY, JSON.stringify(channels || []));
+  } catch (e) { /* ignore */ }
+}
+
+function applyFavoritesUpdate(setFavorites, channels) {
+  const list = channels || [];
+  setFavorites(list);
+  if (API_BASE) persistSavedChannelsCache(list);
+}
+
+function refreshSavedChannelsInBackground(setFavorites) {
+  fetchSavedChannelsFromApi()
+    .then(function (channels) {
+      applyFavoritesUpdate(setFavorites, channels);
+      return migrateLocalFavoritesToApi(channels);
+    })
+    .then(function (channels) {
+      if (channels) applyFavoritesUpdate(setFavorites, channels);
+    })
+    .catch(function (e) {
+      console.warn("Could not refresh saved channels:", e);
+    });
 }
 
 function loadChannelSyncStore() {
@@ -283,27 +510,39 @@ async function loadChannelCache(channelId) {
   }
 }
 
-async function putVideoRecord(store, channelId, rawVideo) {
-  const raw = compactRawVideo(rawVideo);
-  if (!raw || !raw.id) return;
-  const key = videoRecordKey(channelId, raw.id);
-  let topicClassification;
-  try {
-    const existing = await idbRequest(store.get(key));
-    if (existing && existing.topicClassification) topicClassification = existing.topicClassification;
-  } catch (e) { /* preserve classification when updating raw video */ }
-  const record = {
-    id: key,
-    channelId: channelId,
-    videoId: raw.id,
-    raw: raw,
-  };
-  if (topicClassification) record.topicClassification = topicClassification;
-  try {
+async function putVideoRecords(store, channelId, rawVideos, existingByVideoId) {
+  const existingMap = existingByVideoId || {};
+  for (let i = 0; i < rawVideos.length; i++) {
+    const raw = compactRawVideo(rawVideos[i]);
+    if (!raw || !raw.id) continue;
+    const key = videoRecordKey(channelId, raw.id);
+    const record = {
+      id: key,
+      channelId: channelId,
+      videoId: raw.id,
+      raw: raw,
+    };
+    const existing = existingMap[raw.id];
+    if (existing && existing.topicClassification) {
+      record.topicClassification = existing.topicClassification;
+    }
     await idbRequest(store.put(record));
-  } catch (e) {
-    throw wrapIdbError(e, "Could not save video cache.");
   }
+}
+
+async function saveChannelVideos(channelId, rawVideos) {
+  if (!rawVideos || !rawVideos.length) return;
+  const db = await openChannelCacheDb();
+  const tx = db.transaction(VIDEO_STORE, "readwrite");
+  const store = tx.objectStore(VIDEO_STORE);
+  const index = store.index("byChannelId");
+  const existingRecords = await idbRequest(index.getAll(channelId));
+  const existingByVideoId = {};
+  (existingRecords || []).forEach(function (record) {
+    if (record && record.videoId) existingByVideoId[record.videoId] = record;
+  });
+  await putVideoRecords(store, channelId, rawVideos, existingByVideoId);
+  await waitTransaction(tx);
 }
 
 async function saveVideoTopicClassification(channelId, videoId, classification) {
@@ -340,17 +579,6 @@ async function saveChannelMeta(channelMeta) {
   }
 }
 
-async function saveChannelVideos(channelId, rawVideos) {
-  if (!rawVideos || !rawVideos.length) return;
-  const db = await openChannelCacheDb();
-  const tx = db.transaction(VIDEO_STORE, "readwrite");
-  const store = tx.objectStore(VIDEO_STORE);
-  for (let i = 0; i < rawVideos.length; i++) {
-    await putVideoRecord(store, channelId, rawVideos[i]);
-  }
-  await waitTransaction(tx);
-}
-
 async function saveChannelCache(entry) {
   const normalized = {
     version: CACHE_VERSION,
@@ -368,11 +596,6 @@ async function saveChannelCache(entry) {
   const channelMeta = toChannelMeta(normalized);
   await saveChannelMeta(channelMeta);
   await saveChannelVideos(normalized.channelId, normalized.rawVideos);
-  const reloaded = await loadChannelCache(normalized.channelId);
-  if (reloaded) {
-    memoryChannelCache.set(normalized.channelId, reloaded);
-    return reloaded;
-  }
   memoryChannelCache.set(normalized.channelId, normalized);
   return normalized;
 }
@@ -442,10 +665,7 @@ async function migrateLegacyChannelCache() {
 }
 
 function isCacheFresh(entry) {
-  const syncMeta = entry && entry.channelId ? loadChannelSyncMeta(entry.channelId) : null;
-  const ts = (syncMeta && syncMeta.lastSyncedAt) || entry.lastSyncedAt || entry.lastAnalyzedAt;
-  if (!ts) return false;
-  return Date.now() - new Date(ts).getTime() < CACHE_FRESH_MS;
+  return !!(entry && (entry.lastSyncedAt || entry.lastAnalyzedAt));
 }
 
 function buildResultFromCache(entry) {
@@ -2337,16 +2557,16 @@ function Spinner(props) {
 
 function StatCard(props) {
   return (
-    <div className="rounded-xl border border-slate-200 bg-white p-3 shadow-sm">
+    <div className="flex h-full flex-col rounded-xl border border-slate-200 bg-white p-3 shadow-sm sm:p-4">
       <div className="flex items-center gap-1.5 text-xs font-medium text-slate-500">
-        <span className="flex h-6 w-6 items-center justify-center rounded-md bg-slate-100 text-slate-600">{props.icon}</span>
+        <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-slate-100 text-slate-600">{props.icon}</span>
         <span className="flex min-w-0 items-center gap-0.5">
-          <span>{props.label}</span>
+          <span className="truncate">{props.label}</span>
           {props.hint ? <InfoTip text={props.hint} placement="bottom" label={props.label} /> : null}
         </span>
       </div>
-      <div className="mt-2 text-xl font-bold text-slate-900">{props.value}</div>
-      <div className="mt-0.5 text-[11px] text-slate-400">{props.note}</div>
+      <div className="mt-2 text-lg font-bold text-slate-900 sm:text-xl">{props.value}</div>
+      <div className="mt-auto pt-0.5 text-[11px] leading-snug text-slate-400">{props.note || "\u00a0"}</div>
       {props.children}
     </div>
   );
@@ -2582,8 +2802,28 @@ function InfoTip(props) {
 function PanelTitle(props) {
   return (
     <div className="inline-flex items-center gap-1.5">
-      <h2 className="text-base font-bold text-slate-900">{props.children}</h2>
+      <h2 className="text-base font-bold leading-tight text-slate-900">{props.children}</h2>
       {props.hint ? <InfoTip text={props.hint} placement="bottom" label={props.children} /> : null}
+    </div>
+  );
+}
+
+function PanelSectionHeader(props) {
+  return (
+    <div className={"flex flex-col gap-3 border-b border-slate-100 pb-4 " + (props.className || "")}>
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <div className="min-w-0">{props.title}</div>
+        {props.actions ? (
+          <div className="flex shrink-0 flex-wrap items-center gap-2 sm:justify-end">
+            {props.actions}
+          </div>
+        ) : null}
+      </div>
+      {props.children ? (
+        <div className="flex flex-wrap items-center gap-2">
+          {props.children}
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -2614,9 +2854,9 @@ function ContentFormatSelector(props) {
     { id: "live", label: "Live" },
   ];
   return (
-    <div className="flex items-center gap-2 whitespace-nowrap">
+    <div className="flex flex-wrap items-center gap-2">
       <span className="text-xs font-medium text-slate-500">Content</span>
-      <div className="inline-flex rounded-lg border border-slate-200 bg-white p-0.5 shadow-sm">
+      <div className="inline-flex max-w-full flex-wrap rounded-lg border border-slate-200 bg-white p-0.5 shadow-sm">
         {options.map(function (opt) {
           const active = props.value === opt.id;
           return (
@@ -2624,7 +2864,7 @@ function ContentFormatSelector(props) {
               key={opt.id}
               type="button"
               onClick={function () { props.onChange(opt.id); }}
-              className={"rounded-md px-3 py-1.5 text-xs font-semibold transition " +
+              className={"rounded-md px-2.5 py-1.5 text-xs font-semibold transition sm:px-3 " +
                 (active ? "bg-slate-900 text-white" : "text-slate-600 hover:bg-slate-50")}
             >
               {opt.label}
@@ -2879,16 +3119,13 @@ function ContentPerformancePanel(props) {
 
   return (
     <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm sm:p-5">
-      <div className="flex items-center gap-3 border-b border-slate-100 pb-4">
-        <div className="shrink-0">
+      <PanelSectionHeader
+        title={
           <PanelTitle hint="How well videos perform in the selected period — views, engagement, outliers, and trends. Analyze all content or filter by long-form, Shorts, or Live.">
             Content Performance
           </PanelTitle>
-        </div>
-        <div className="flex min-w-0 flex-1 justify-center">
-          <ContentFormatSelector value={contentFormat} onChange={handleFormatChange} />
-        </div>
-        <div className="shrink-0">
+        }
+        actions={
           <ActivityPeriodControls
             id="content-performance-period"
             value={range}
@@ -2896,8 +3133,10 @@ function ContentPerformancePanel(props) {
             hint="The date range used for performance metrics in this section."
             compact={true}
           />
-        </div>
-      </div>
+        }
+      >
+        <ContentFormatSelector value={contentFormat} onChange={handleFormatChange} />
+      </PanelSectionHeader>
       {perf.periodLabel && (
         <p className="mt-2 text-[11px] text-slate-400">{perf.periodLabel}</p>
       )}
@@ -3281,33 +3520,35 @@ function ContentTopicsPanel(props) {
 
   return (
     <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm sm:p-5">
-      <div className="flex items-center gap-3 border-b border-slate-100 pb-4">
-        <div className="min-w-0 flex-1">
+      <PanelSectionHeader
+        title={
           <PanelTitle hint="What topics this channel covers, how much focus each gets, which perform best, and how the mix is shifting. Click Run to classify videos with Gemini AI — this uses API tokens and does not start automatically.">
             Content Topics
           </PanelTitle>
-        </div>
-        <div className="flex shrink-0 items-center gap-2">
-          {canRunClassification && (
-            <button
-              type="button"
-              onClick={runClassification}
-              disabled={classifying}
-              className="inline-flex items-center justify-center gap-1.5 rounded-lg bg-slate-900 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              {classifying ? <Spinner className="h-3.5 w-3.5 text-white" /> : null}
-              {classifying ? "Running…" : "Run"}
-            </button>
-          )}
-          <ActivityPeriodControls
-            id="content-topics-period"
-            value={range}
-            onChange={props.onRangeChange}
-            hint="The date range used for topic analysis in this section."
-            compact={true}
-          />
-        </div>
-      </div>
+        }
+        actions={
+          <>
+            {canRunClassification && (
+              <button
+                type="button"
+                onClick={runClassification}
+                disabled={classifying}
+                className="inline-flex h-[34px] items-center justify-center gap-1.5 rounded-lg bg-slate-900 px-3 text-xs font-semibold text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {classifying ? <Spinner className="h-3.5 w-3.5 text-white" /> : null}
+                {classifying ? "Running…" : "Run"}
+              </button>
+            )}
+            <ActivityPeriodControls
+              id="content-topics-period"
+              value={range}
+              onChange={props.onRangeChange}
+              hint="The date range used for topic analysis in this section."
+              compact={true}
+            />
+          </>
+        }
+      />
       {data.periodLabel && (
         <p className="mt-2 text-[11px] text-slate-400">{data.periodLabel}</p>
       )}
@@ -3487,9 +3728,9 @@ function PublishingInsightsPanel(props) {
   const liveDelta = formatCompactDelta(insights.currentLive, insights.previousLive);
 
   return (
-    <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-        <div>
+    <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm sm:p-5">
+      <div className="flex flex-col gap-3 border-b border-slate-100 pb-4 sm:flex-row sm:items-center sm:justify-between">
+        <div className="min-w-0">
           <PanelTitle hint="How often this channel publishes, what content formats they focus on, and how upload activity is trending vs the previous period.">
             Publishing Insights
           </PanelTitle>
@@ -3497,14 +3738,17 @@ function PublishingInsightsPanel(props) {
             <p className="mt-0.5 text-[11px] text-slate-400">{insights.periodLabel}</p>
           )}
         </div>
-        <ActivityPeriodControls
-          value={range}
-          onChange={props.onRangeChange}
-          hint="The date range used for upload counts and trends in this section."
-        />
+        <div className="shrink-0">
+          <ActivityPeriodControls
+            value={range}
+            onChange={props.onRangeChange}
+            hint="The date range used for upload counts and trends in this section."
+          />
+        </div>
       </div>
 
-      <div className="mt-4 rounded-lg bg-slate-50 p-3.5">
+      <div className="mt-4 grid gap-4 xl:grid-cols-2 xl:items-start">
+      <div className="rounded-lg bg-slate-50 p-3.5 sm:p-4">
         <div className="flex flex-wrap items-center gap-1">
           <InsightLabel hint="Total videos published in this period. The % change compares to the previous period of the same length.">
             Upload summary
@@ -3556,10 +3800,10 @@ function PublishingInsightsPanel(props) {
             <p className="mt-1 text-sm text-slate-700">
               <span className="font-semibold text-slate-900">{formatNumber(insights.currentLong)}</span> long-form{" "}
               <InlineDelta delta={longDelta} />
-              <span className="mx-2 text-slate-300">·</span>
+              <span className="mx-1 text-slate-300 sm:mx-2">·</span>
               <span className="font-semibold text-sky-600">{formatNumber(insights.currentShort)}</span> Shorts{" "}
               <InlineDelta delta={shortDelta} />
-              <span className="mx-2 text-slate-300">·</span>
+              <span className="mx-1 text-slate-300 sm:mx-2">·</span>
               <span className="font-semibold text-rose-600">{formatNumber(insights.currentLive)}</span> Live{" "}
               <InlineDelta delta={liveDelta} />
             </p>
@@ -3584,8 +3828,9 @@ function PublishingInsightsPanel(props) {
         </div>
       </div>
 
-      <div className="mt-4">
+      <div className="xl:pt-1">
         <PublishingTrendSparkline trend={insights.trend} granularity={insights.trendGranularity} />
+      </div>
       </div>
 
       {insights.observations && insights.observations.length > 0 && (
@@ -3624,8 +3869,8 @@ function ActivityPeriodControls(props) {
   const compactRow = props.compact && range.type !== "custom";
 
   return (
-    <div className={"flex gap-2 " + (compactRow ? "flex-row items-center" : "flex-col items-stretch sm:items-end")}>
-      <div className="flex items-center gap-2">
+    <div className={"flex flex-wrap items-center gap-2 " + (compactRow ? "w-full sm:w-auto" : "w-full sm:w-auto")}>
+      <div className={"flex min-w-0 items-center gap-2 " + (compactRow ? "" : "w-full sm:w-auto")}>
         <label htmlFor={selectId} className="flex shrink-0 items-center gap-1 text-xs font-medium text-slate-500">
           <span>Period</span>
           {props.hint ? <InfoTip text={props.hint} placement="bottom" label="Period" /> : null}
@@ -3644,7 +3889,7 @@ function ActivityPeriodControls(props) {
             }
             props.onChange({ type: "preset", days: parseInt(v.split(":")[1], 10) });
           }}
-          className={fieldCls + " min-w-[140px]"}
+          className={fieldCls + " w-full min-w-0 sm:min-w-[140px]"}
         >
           {ACTIVITY_PERIODS.map(function (p) {
             return <option key={p.days} value={"preset:" + p.days}>{p.label}</option>;
@@ -3653,19 +3898,19 @@ function ActivityPeriodControls(props) {
         </select>
       </div>
       {range.type === "custom" && (
-        <div className="flex items-center gap-2">
+        <div className="flex w-full flex-col gap-2 sm:w-auto sm:flex-row sm:items-center">
           <input
             type="date"
             value={range.start}
             onChange={function (e) { applyCustom(e.target.value, range.end); }}
-            className={dateCls}
+            className={dateCls + " w-full min-w-0 sm:w-auto"}
           />
-          <span className="text-xs text-slate-400">–</span>
+          <span className="hidden text-xs text-slate-400 sm:inline">–</span>
           <input
             type="date"
             value={range.end}
             onChange={function (e) { applyCustom(range.start, e.target.value); }}
-            className={dateCls}
+            className={dateCls + " w-full min-w-0 sm:w-auto"}
           />
         </div>
       )}
@@ -3710,7 +3955,24 @@ function FavoriteChip(props) {
 
 function FavoriteList(props) {
   const [showAll, setShowAll] = useState(false);
-  if (!props.items.length) return null;
+  if (!props.items.length) {
+    if (!props.showEmpty) return null;
+    return (
+      <div className={props.className || ""}>
+        <div className="mb-2 flex items-center gap-1 text-[11px] font-semibold uppercase tracking-wider text-slate-400">
+          <span>Saved channels</span>
+          <InfoTip
+            text="Channels you save are stored in your account and appear here every time you sign in."
+            placement="bottom"
+            label="Saved channels"
+          />
+        </div>
+        <p className="rounded-xl border border-dashed border-slate-200 bg-white px-4 py-3 text-sm text-slate-500">
+          Save a channel with the star button to reopen it quickly next time.
+        </p>
+      </div>
+    );
+  }
 
   const visible = props.items.slice(0, VISIBLE_FAVORITES);
   const hasMore = props.items.length > VISIBLE_FAVORITES;
@@ -3721,7 +3983,7 @@ function FavoriteList(props) {
         <div className="flex items-center gap-1 text-[11px] font-semibold uppercase tracking-wider text-slate-400">
           <span>Saved channels</span>
           <InfoTip
-            text="Channels saved for quick access. After the first analysis, data is cached locally so switching back is instant."
+            text="Channels you save are stored in your account and appear here every time you sign in."
             placement="bottom"
             label="Saved channels"
           />
@@ -3825,7 +4087,7 @@ function FavoriteList(props) {
 function ChannelForm(props) {
   return (
     <form
-      className={"flex w-full gap-2 " + (props.compact ? "max-w-md" : "max-w-xl flex-col sm:flex-row")}
+      className={"flex w-full gap-2 " + (props.compact ? "flex-col sm:flex-row" : "max-w-xl flex-col sm:flex-row")}
       onSubmit={function (e) {
         e.preventDefault();
         if (props.phase !== "loading") props.onSubmit();
@@ -3861,7 +4123,189 @@ function LoadingState(props) {
   );
 }
 
+function AuthScreen(props) {
+  const [mode, setMode] = useState("login");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [displayName, setDisplayName] = useState("");
+  const [rememberMe, setRememberMe] = useState(true);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+
+  const submit = async function (e) {
+    e.preventDefault();
+    setError(null);
+
+    if (!email.trim()) {
+      setError("Enter your email address.");
+      return;
+    }
+    if (!password) {
+      setError("Enter your password.");
+      return;
+    }
+    if (mode === "signup") {
+      if (password.length < 6) {
+        setError("Password must be at least 6 characters.");
+        return;
+      }
+      if (password !== confirmPassword) {
+        setError("Passwords do not match.");
+        return;
+      }
+    }
+
+    setLoading(true);
+    try {
+      if (mode === "signup") {
+        await apiRequest("/auth/signup", {
+          method: "POST",
+          body: { email: email.trim(), password: password, displayName: displayName.trim() || undefined },
+        });
+      }
+      const result = await apiRequest("/auth/login", {
+        method: "POST",
+        body: { email: email.trim(), password: password, rememberMe: rememberMe },
+      });
+      storeAuthToken(result.token, result.rememberMe);
+      props.onAuthSuccess(result.user);
+    } catch (err) {
+      setError(formatApiError(err));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="flex min-h-screen items-center justify-center bg-slate-50 px-5 py-10">
+      <div className="w-full max-w-md rounded-2xl border border-slate-200 bg-white p-8 shadow-sm">
+        <div className="mb-6 text-center">
+          <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-2xl bg-slate-900 text-lg font-bold text-white">Y</div>
+          <h1 className="text-xl font-bold text-slate-900">YouTube Channel Analyzer</h1>
+          <p className="mt-1 text-sm text-slate-500">
+            {mode === "login" ? "Sign in to continue" : "Create your free account"}
+          </p>
+        </div>
+
+        <div className="mb-6 flex rounded-xl bg-slate-100 p-1">
+          <button
+            type="button"
+            onClick={function () { setMode("login"); setError(null); }}
+            className={"flex-1 rounded-lg px-3 py-2 text-sm font-semibold transition " +
+              (mode === "login" ? "bg-white text-slate-900 shadow-sm" : "text-slate-500 hover:text-slate-700")}
+          >
+            Sign in
+          </button>
+          <button
+            type="button"
+            onClick={function () { setMode("signup"); setError(null); }}
+            className={"flex-1 rounded-lg px-3 py-2 text-sm font-semibold transition " +
+              (mode === "signup" ? "bg-white text-slate-900 shadow-sm" : "text-slate-500 hover:text-slate-700")}
+          >
+            Create account
+          </button>
+        </div>
+
+        <form className="space-y-4" onSubmit={submit}>
+          {mode === "signup" && (
+            <div>
+              <label className="mb-1.5 block text-sm font-medium text-slate-700">Name</label>
+              <input
+                type="text"
+                autoComplete="name"
+                value={displayName}
+                onChange={function (e) { setDisplayName(e.target.value); }}
+                placeholder="Your name (optional)"
+                className="w-full rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-900 placeholder-slate-400 outline-none transition focus:border-slate-400 focus:ring-2 focus:ring-slate-200"
+              />
+            </div>
+          )}
+
+          <div>
+            <label className="mb-1.5 block text-sm font-medium text-slate-700">Email</label>
+            <input
+              type="email"
+              autoComplete="email"
+              required
+              value={email}
+              onChange={function (e) { setEmail(e.target.value); }}
+              placeholder="you@example.com"
+              className="w-full rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-900 placeholder-slate-400 outline-none transition focus:border-slate-400 focus:ring-2 focus:ring-slate-200"
+            />
+          </div>
+
+          <div>
+            <label className="mb-1.5 block text-sm font-medium text-slate-700">Password</label>
+            <input
+              type="password"
+              autoComplete={mode === "signup" ? "new-password" : "current-password"}
+              required
+              value={password}
+              onChange={function (e) { setPassword(e.target.value); }}
+              placeholder={mode === "signup" ? "At least 6 characters" : "Your password"}
+              className="w-full rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-900 placeholder-slate-400 outline-none transition focus:border-slate-400 focus:ring-2 focus:ring-slate-200"
+            />
+          </div>
+
+          {mode === "signup" && (
+            <div>
+              <label className="mb-1.5 block text-sm font-medium text-slate-700">Confirm password</label>
+              <input
+                type="password"
+                autoComplete="new-password"
+                required
+                value={confirmPassword}
+                onChange={function (e) { setConfirmPassword(e.target.value); }}
+                placeholder="Repeat your password"
+                className="w-full rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-900 placeholder-slate-400 outline-none transition focus:border-slate-400 focus:ring-2 focus:ring-slate-200"
+              />
+            </div>
+          )}
+
+          {mode === "login" && (
+            <label className="flex cursor-pointer items-center gap-2.5 text-sm text-slate-600">
+              <input
+                type="checkbox"
+                checked={rememberMe}
+                onChange={function (e) { setRememberMe(e.target.checked); }}
+                className="h-4 w-4 rounded border-slate-300 text-slate-900 focus:ring-slate-300"
+              />
+              Keep me signed in
+            </label>
+          )}
+
+          {error && (
+            <div className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-600">
+              {error}
+            </div>
+          )}
+
+          <button
+            type="submit"
+            disabled={loading}
+            className="inline-flex w-full items-center justify-center gap-2 rounded-xl bg-slate-900 px-5 py-3 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {loading && <Spinner className="h-4 w-4 text-white" />}
+            {loading
+              ? (mode === "login" ? "Signing in…" : "Creating account…")
+              : (mode === "login" ? "Sign in" : "Create account")}
+          </button>
+        </form>
+      </div>
+    </div>
+  );
+}
+
 function App() {
+  const [authUser, setAuthUser] = useState(function () {
+    if (!API_BASE || !getStoredAuthToken()) return null;
+    return loadCachedAuthUser();
+  });
+  const [authLoading, setAuthLoading] = useState(function () {
+    if (!API_BASE) return false;
+    return !!getStoredAuthToken() && !loadCachedAuthUser();
+  });
   const [channelInput, setChannelInput] = useState("");
   const [phase, setPhase] = useState("idle"); // idle | loading | done | error
   const [refreshing, setRefreshing] = useState(false);
@@ -3869,11 +4313,53 @@ function App() {
   const [error, setError] = useState(null);
   const [cacheWarning, setCacheWarning] = useState(null);
   const [result, setResult] = useState(null);
-  const [favorites, setFavorites] = useState(function () { return loadFavorites(); });
+  const [favorites, setFavorites] = useState(function () {
+    if (API_BASE) return loadSavedChannelsCache();
+    return loadFavorites();
+  });
   const [activityRange, setActivityRange] = useState(DEFAULT_ACTIVITY_RANGE);
   const [contentPerformanceRange, setContentPerformanceRange] = useState(DEFAULT_ACTIVITY_RANGE);
   const [contentTopicsRange, setContentTopicsRange] = useState(DEFAULT_ACTIVITY_RANGE);
   const analysisGenRef = useRef(0);
+
+  useEffect(function () {
+    if (!API_BASE) {
+      setAuthLoading(false);
+      return;
+    }
+    const token = getStoredAuthToken();
+    if (!token) {
+      setAuthLoading(false);
+      return;
+    }
+    apiRequest("/auth/me")
+      .then(function (data) {
+        setAuthUser(data.user);
+        persistCachedAuthUser(data.user);
+        refreshSavedChannelsInBackground(setFavorites);
+      })
+      .catch(function () {
+        clearAuthToken();
+      })
+      .finally(function () {
+        setAuthLoading(false);
+      });
+  }, []);
+
+  const handleLogout = useCallback(async function () {
+    try {
+      await apiRequest("/auth/logout", { method: "POST" });
+    } catch (e) {
+      // ignore — clear local session anyway
+    }
+    clearAuthToken();
+    setAuthUser(null);
+    setResult(null);
+    setPhase("idle");
+    setError(null);
+    setFavorites([]);
+    try { localStorage.removeItem(SAVED_CHANNELS_CACHE_KEY); } catch (e) { /* ignore */ }
+  }, []);
 
   useEffect(function () {
     migrateLegacyChannelCache();
@@ -3888,24 +4374,54 @@ function App() {
   }, []);
 
   const runBackgroundRefresh = useCallback(async function (cacheEntry, gen) {
-    const apiKey = YOUTUBE_API_KEY;
-    if (!apiKey) return;
+    if (!API_BASE) {
+      const apiKey = YOUTUBE_API_KEY;
+      if (!apiKey) return;
+      setRefreshing(true);
+      setStatusMsg("Updating channel data…");
+      try {
+        const updated = await refreshChannelCache(apiKey, cacheEntry, function (msg) {
+          if (gen !== analysisGenRef.current) return;
+          setStatusMsg(msg);
+        });
+        if (gen !== analysisGenRef.current) return;
+        applyCacheEntry(updated);
+        setCacheWarning(null);
+      } catch (e) {
+        if (gen !== analysisGenRef.current) return;
+        const msg = e && e.code === "QUOTA_EXCEEDED"
+          ? e.message
+          : (e && e.message ? e.message : "Background update failed.");
+        setCacheWarning(msg);
+      } finally {
+        if (gen === analysisGenRef.current) {
+          setRefreshing(false);
+          setStatusMsg("");
+        }
+      }
+      return;
+    }
+
     setRefreshing(true);
     setStatusMsg("Updating channel data…");
     try {
-      const updated = await refreshChannelCache(apiKey, cacheEntry, function (msg) {
+      const handle = cacheEntry.channel && cacheEntry.channel.title
+        ? ("https://www.youtube.com/channel/" + cacheEntry.channelId)
+        : cacheEntry.channelId;
+      let response = await analyzeChannelViaApi(handle, function (msg) {
         if (gen !== analysisGenRef.current) return;
         setStatusMsg(msg);
-      });
+      }, { channelId: cacheEntry.channelId });
+      let entry = response.entry;
+      entry = await mergeLocalTopicClassifications(entry);
       if (gen !== analysisGenRef.current) return;
-      applyCacheEntry(updated);
+      await saveChannelCache(entry);
+      if (gen !== analysisGenRef.current) return;
+      applyCacheEntry(entry);
       setCacheWarning(null);
     } catch (e) {
       if (gen !== analysisGenRef.current) return;
-      const msg = e && e.code === "QUOTA_EXCEEDED"
-        ? e.message
-        : (e && e.message ? e.message : "Background update failed.");
-      setCacheWarning(msg);
+      setCacheWarning(e && e.message ? e.message : "Background update failed.");
     } finally {
       if (gen === analysisGenRef.current) {
         setRefreshing(false);
@@ -3927,23 +4443,16 @@ function App() {
     };
     memoryChannelCache.set(cacheEntry.channelId, interim);
     applyCacheEntry(interim);
-    try {
-      await saveChannelCache(cacheEntry);
-      if (gen !== analysisGenRef.current) return;
-      setCacheWarning(null);
-      const reloaded = await loadChannelCache(cacheEntry.channelId);
-      if (reloaded && gen === analysisGenRef.current) {
-        memoryChannelCache.set(cacheEntry.channelId, reloaded);
-        applyCacheEntry(reloaded);
-      }
-    } catch (e) {
+    saveChannelCache(cacheEntry).then(function () {
+      if (gen === analysisGenRef.current) setCacheWarning(null);
+    }).catch(function (e) {
       if (gen !== analysisGenRef.current) return;
       if (e && e.code === "QUOTA_EXCEEDED") {
         setCacheWarning(e.message);
       } else {
         setCacheWarning((e && e.message) || "Could not save channel cache.");
       }
-    }
+    });
   }, [applyCacheEntry]);
 
   const showCachedChannel = useCallback(function (cached, gen) {
@@ -3973,23 +4482,38 @@ function App() {
       return;
     }
 
+    if (hintedId && !opts.force) {
+      const dbCached = await loadChannelCache(hintedId);
+      if (gen !== analysisGenRef.current) return;
+      if (dbCached) {
+        showCachedChannel(dbCached, gen);
+        return;
+      }
+    }
+
     setRefreshing(false);
 
     try {
       const attempts = parseChannelInput(raw);
       if (!attempts) throw new Error("Enter a channel name, @handle, or URL.");
 
-      if (hintedId && !opts.force) {
-        if (!loadChannelCacheSync(hintedId)) {
+      if (API_BASE) {
+        if (!syncCached) {
           setPhase("loading");
-          setStatusMsg("Loading saved channel…");
+          setStatusMsg(opts.channelId ? "Loading saved channel…" : "Checking shared database cache…");
         }
-        const dbCached = await loadChannelCache(hintedId);
+        let response = await analyzeChannelViaApi(raw, function (msg) {
+          if (gen !== analysisGenRef.current) return;
+          setStatusMsg(msg);
+        }, { channelId: opts.channelId });
         if (gen !== analysisGenRef.current) return;
-        if (dbCached) {
-          showCachedChannel(dbCached, gen);
-          return;
-        }
+        let entry = response.entry;
+        entry = await mergeLocalTopicClassifications(entry);
+        setActivityRange(DEFAULT_ACTIVITY_RANGE);
+        setContentPerformanceRange(DEFAULT_ACTIVITY_RANGE);
+        setContentTopicsRange(DEFAULT_ACTIVITY_RANGE);
+        await persistAnalysisResult(entry, gen);
+        return;
       }
 
       if (!syncCached) {
@@ -4033,7 +4557,16 @@ function App() {
     }
   }, [channelInput, applyCacheEntry, showCachedChannel, persistAnalysisResult]);
 
-  const removeFavorite = useCallback(function (id) {
+  const removeFavorite = useCallback(async function (id) {
+    if (API_BASE) {
+      try {
+        const channels = await removeChannelFromApi(id);
+        applyFavoritesUpdate(setFavorites, channels);
+      } catch (e) {
+        setCacheWarning(e.message || "Could not remove saved channel.");
+      }
+      return;
+    }
     setFavorites(function (prev) {
       const next = prev.filter(function (f) { return f.id !== id; });
       persistFavorites(next);
@@ -4041,9 +4574,21 @@ function App() {
     });
   }, []);
 
-  const toggleFavorite = useCallback(function () {
+  const toggleFavorite = useCallback(async function () {
     if (!result || !result.channel) return;
     const ch = result.channel;
+    if (API_BASE) {
+      const exists = favorites.some(function (f) { return f.id === ch.id; });
+      try {
+        const channels = exists
+          ? await removeChannelFromApi(ch.id)
+          : await saveChannelToApi(ch);
+        applyFavoritesUpdate(setFavorites, channels);
+      } catch (e) {
+        setCacheWarning(e.message || "Could not update saved channel.");
+      }
+      return;
+    }
     setFavorites(function (prev) {
       const exists = prev.some(function (f) { return f.id === ch.id; });
       const next = exists
@@ -4057,7 +4602,7 @@ function App() {
       persistFavorites(next);
       return next;
     });
-  }, [result]);
+  }, [result, favorites]);
 
   const openFavorite = useCallback(function (fav) {
     runAnalysis(fav.query || fav.id, { channelId: fav.id });
@@ -4103,29 +4648,61 @@ function App() {
     />
   );
 
+  if (API_BASE && authLoading) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-slate-50">
+        <LoadingState message="Checking your session…" />
+      </div>
+    );
+  }
+
+  if (API_BASE && !authUser) {
+    return <AuthScreen onAuthSuccess={function (user) {
+      setAuthUser(user);
+      persistCachedAuthUser(user);
+      refreshSavedChannelsInBackground(setFavorites);
+    }} />;
+  }
+
   return (
     <div className="min-h-screen bg-slate-50">
       <header className="sticky top-0 z-10 border-b border-slate-200 bg-white/90 backdrop-blur">
-        <div className="mx-auto max-w-6xl px-5 py-4 sm:px-8">
-          <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
-            <div className="flex items-center gap-2">
+        <div className="app-container py-3 sm:py-4">
+          <div className="flex flex-col gap-3 xl:grid xl:grid-cols-[auto_1fr_auto] xl:items-center xl:gap-6">
+            <div className="flex min-w-0 shrink-0 items-center gap-2">
               <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-slate-900 text-sm font-bold text-white">Y</div>
-              <div>
-                <div className="text-base font-bold text-slate-900">YouTube Channel Analyzer</div>
-                <div className="text-xs text-slate-500">Enter a channel name to analyze</div>
+              <div className="min-w-0">
+                <div className="truncate text-base font-bold text-slate-900">YouTube Channel Analyzer</div>
+                <div className="hidden text-xs text-slate-500 sm:block">Enter a channel name to analyze</div>
               </div>
             </div>
-            <div className="w-full lg:max-w-md">{form}</div>
+            <div className="min-w-0">{form}</div>
+            {authUser && (
+              <div className="flex shrink-0 items-center justify-between gap-2 xl:justify-end">
+                <div className="min-w-0 xl:text-right">
+                  <div className="truncate text-sm font-medium text-slate-800">{authUser.displayName}</div>
+                  <div className="hidden truncate text-xs text-slate-400 sm:block">{authUser.email}</div>
+                </div>
+                <button
+                  type="button"
+                  onClick={handleLogout}
+                  className="shrink-0 rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-600 transition hover:border-slate-300 hover:text-slate-900"
+                >
+                  Sign out
+                </button>
+              </div>
+            )}
           </div>
         </div>
       </header>
 
-      <main className="mx-auto max-w-6xl px-5 py-6 sm:px-8 sm:py-8">
+      <main className="app-container py-5 sm:py-6 lg:py-8">
         <FavoriteList
           className="mb-6"
           items={favorites}
           activeId={result ? result.channel.id : null}
           disabled={isInitialLoading}
+          showEmpty={Boolean(API_BASE && authUser)}
           onOpen={openFavorite}
           onRemove={removeFavorite}
         />
@@ -4167,14 +4744,14 @@ function App() {
                 )}
               </div>
             )}
-            <div className="flex items-start justify-between gap-3">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <div className="flex min-w-0 items-center gap-3">
                 {result.channel.thumbnail && (
                   <img src={result.channel.thumbnail} alt="" className="h-12 w-12 shrink-0 rounded-full bg-slate-100" />
                 )}
                 <div className="min-w-0">
-                  <div className="flex items-center gap-2">
-                    <h1 className="text-2xl font-bold text-slate-900 sm:text-3xl">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <h1 className="text-xl font-bold text-slate-900 sm:text-2xl lg:text-3xl">
                       {result.channel.title}
                     </h1>
                     <a
@@ -4188,7 +4765,7 @@ function App() {
                     </a>
                   </div>
                   {result.lastAnalyzedAt && (
-                    <p className="mt-0.5 flex items-center gap-1 text-xs text-slate-400">
+                    <p className="mt-0.5 flex flex-wrap items-center gap-1 text-xs text-slate-400">
                       <span>Last analyzed {formatLastAnalyzed(result.lastAnalyzedAt)}</span>
                       <InfoTip
                         text="When this channel's video data was last fetched or refreshed from YouTube."
@@ -4202,7 +4779,7 @@ function App() {
               <button
                 type="button"
                 onClick={toggleFavorite}
-                className={"inline-flex shrink-0 items-center gap-1.5 rounded-xl border px-3 py-2 text-sm font-semibold transition " +
+                className={"inline-flex w-full shrink-0 items-center justify-center gap-1.5 rounded-xl border px-3 py-2 text-sm font-semibold transition sm:w-auto " +
                   (favorites.some(function (f) { return f.id === result.channel.id; })
                     ? "border-amber-200 bg-amber-50 text-amber-600"
                     : "border-slate-200 bg-white text-slate-600 hover:border-slate-300")}
@@ -4211,7 +4788,7 @@ function App() {
                 {favorites.some(function (f) { return f.id === result.channel.id; }) ? "Saved" : "Save"}
               </button>
             </div>
-              <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
+              <div className="grid grid-cols-2 items-stretch gap-3 sm:grid-cols-3 lg:grid-cols-5 xl:gap-4">
                 <StatCard
                   icon={<IconUsers className="h-4 w-4" />}
                   label="Subscribers"

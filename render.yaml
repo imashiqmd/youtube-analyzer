@@ -1,0 +1,20 @@
+# Render Blueprint — https://render.com/docs/blueprint-spec
+# Connect this repo in Render → New → Blueprint → select youtube-analyzer
+services:
+  - type: web
+    name: youtube-analyzer-api
+    runtime: node
+    rootDir: backend
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
+      - key: DATABASE_URL
+        sync: false
+      - key: YOUTUBE_API_KEY
+        sync: false
+      - key: ADMIN_EMAIL
+        sync: false
