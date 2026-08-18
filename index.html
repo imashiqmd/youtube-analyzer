@@ -2775,6 +2775,174 @@ function buildTitleLengthInsight(buckets, totalVideos) {
   };
 }
 
+const TITLE_FORMAT_DEFS = [
+  { id: "how-to", label: "How-to", shortLabel: "How-to" },
+  { id: "question", label: "Question", shortLabel: "Question" },
+  { id: "list-number", label: "List/Number", shortLabel: "List" },
+  { id: "comparison", label: "Comparison", shortLabel: "Compare" },
+  { id: "review", label: "Review", shortLabel: "Review" },
+  { id: "guide", label: "Guide", shortLabel: "Guide" },
+  { id: "best-top", label: "Best/Top", shortLabel: "Best/Top" },
+  { id: "experience", label: "Experience/Experiment", shortLabel: "Experience" },
+  { id: "news-update", label: "News/Update", shortLabel: "News" },
+  { id: "other", label: "Other", shortLabel: "Other" },
+];
+const TITLE_FORMAT_MIN_INSIGHT_VIDEOS = 3;
+
+function extractTitleCharacteristics(title) {
+  const t = (title || "").trim();
+  return {
+    has_question: /\?/.test(t) || /^(why|what|how|is|can|should|will)\b/i.test(t),
+    has_number: /\d/.test(t),
+    has_vs: /\bvs\.?\b/i.test(t) || /\bversus\b/i.test(t),
+    has_colon: /:/.test(t),
+    has_brackets: /\[|\]/.test(t),
+    has_parentheses: /\(|\)/.test(t),
+  };
+}
+
+function classifyTitleFormat(title) {
+  const t = (title || "").trim();
+  if (!t) return "other";
+
+  if (/\bhow\s+to\b/i.test(t) || /\bhow\s+i\b/i.test(t) || /\bhow\s+do\s+i\b/i.test(t)) {
+    return "how-to";
+  }
+  if (/\?/.test(t) || /^(why|what|how|is|can|should|will)\b/i.test(t)) {
+    return "question";
+  }
+  if (
+    /^\d/.test(t) ||
+    /\b\d+\s+(ways|tips|tools|reasons|things|steps|ideas|secrets|mistakes|hacks|tricks|methods|apps|sites|websites|plugins|extensions|books|courses|videos|examples|lessons|rules|facts|signs|benefits|uses|features)\b/i.test(t)
+  ) {
+    return "list-number";
+  }
+  if (/\bvs\.?\b/i.test(t) || /\bversus\b/i.test(t)) {
+    return "comparison";
+  }
+  if (/\breview\b/i.test(t) || /\btested\b/i.test(t) || /\btesting\b/i.test(t) || /\bhands[\s-]?on\b/i.test(t)) {
+    return "review";
+  }
+  if (/\bguide\b/i.test(t) || /\bcomplete\s+guide\b/i.test(t) || /\bultimate\s+guide\b/i.test(t) || /\bbeginner'?s?\s+guide\b/i.test(t)) {
+    return "guide";
+  }
+  if (/^(best|top)\b/i.test(t)) {
+    return "best-top";
+  }
+  if (/\bi\s+tried\b/i.test(t) || /\bi\s+tested\b/i.test(t) || /\bi\s+used\b/i.test(t) || /\bi\s+built\b/i.test(t) || /\bi\s+spent\b/i.test(t)) {
+    return "experience";
+  }
+  if (/\bnew\b/i.test(t) || /\blatest\b/i.test(t) || /\bupdate\b/i.test(t) || /\bannounced\b/i.test(t) || /\bjust\s+released\b/i.test(t)) {
+    return "news-update";
+  }
+  return "other";
+}
+
+function classifyVideoTitle(title) {
+  return {
+    primaryFormat: classifyTitleFormat(title),
+    characteristics: extractTitleCharacteristics(title),
+  };
+}
+
+function buildTitleFormatPerformance(items) {
+  if (!items.length) {
+    return {
+      formats: [],
+      channelMedianViews: 0,
+      bestFormatId: null,
+      insight: null,
+      hasEnoughData: false,
+    };
+  }
+
+  const channelViews = items.map(function (v) { return v.viewCount || 0; });
+  const channelMedianViews = medianValue(channelViews);
+  const groups = {};
+  TITLE_FORMAT_DEFS.forEach(function (def) { groups[def.id] = []; });
+
+  items.forEach(function (video) {
+    const classified = classifyVideoTitle(video.title);
+    groups[classified.primaryFormat].push({
+      viewCount: video.viewCount || 0,
+      likeCount: video.likeCount || 0,
+      commentCount: video.commentCount || 0,
+      engagementRate: videoEngagementRate(video),
+      characteristics: classified.characteristics,
+    });
+  });
+
+  const sum = function (arr) { return arr.reduce(function (a, b) { return a + b; }, 0); };
+  const formats = TITLE_FORMAT_DEFS.map(function (def) {
+    const entries = groups[def.id];
+    const count = entries.length;
+    if (!count) return null;
+
+    const views = entries.map(function (e) { return e.viewCount; });
+    const likes = entries.map(function (e) { return e.likeCount; });
+    const comments = entries.map(function (e) { return e.commentCount; });
+    const engagements = entries.map(function (e) { return e.engagementRate; });
+    const medianViews = medianValue(views);
+
+    return {
+      id: def.id,
+      label: def.label,
+      shortLabel: def.shortLabel,
+      count: count,
+      medianViews: medianViews,
+      avgViews: sum(views) / count,
+      medianLikes: medianValue(likes),
+      medianComments: medianValue(comments),
+      engagementRate: sum(engagements) / count,
+      performanceIndex: channelMedianViews > 0 ? medianViews / channelMedianViews : 0,
+      limitedSample: count < TITLE_FORMAT_MIN_INSIGHT_VIDEOS,
+    };
+  }).filter(Boolean);
+
+  formats.sort(function (a, b) {
+    if (b.medianViews !== a.medianViews) return b.medianViews - a.medianViews;
+    return b.count - a.count;
+  });
+
+  const eligible = formats.filter(function (f) { return f.count >= TITLE_FORMAT_MIN_INSIGHT_VIDEOS; });
+  const best = eligible[0] || null;
+  const insightResult = buildTitleFormatInsight(best, eligible.length, items.length);
+
+  return {
+    formats: formats,
+    channelMedianViews: channelMedianViews,
+    bestFormatId: best ? best.id : null,
+    insight: insightResult.text,
+    hasEnoughData: insightResult.hasEnoughData,
+  };
+}
+
+function buildTitleFormatInsight(best, eligibleCount, totalVideos) {
+  if (totalVideos < 3) {
+    return {
+      text: "Not enough videos in this period to compare title formats reliably.",
+      hasEnoughData: false,
+    };
+  }
+
+  if (!best) {
+    return {
+      text: "Title formats are spread across categories, but no format has enough videos yet for a reliable best-format comparison (needs at least " + TITLE_FORMAT_MIN_INSIGHT_VIDEOS + " per format).",
+      hasEnoughData: false,
+    };
+  }
+
+  let text = best.label + " titles perform best, generating " + formatBreakoutMultiplier(best.performanceIndex) + " the channel's median views across " + best.count + " video" + (best.count === 1 ? "" : "s") + ".";
+  if (eligibleCount === 1) {
+    text += " Only one format met the minimum sample size — treat this as directional, not definitive.";
+  }
+
+  return {
+    text: text,
+    hasEnoughData: true,
+  };
+}
+
 function countTitleWords(title) {
   const trimmed = (title || "").trim();
   if (!trimmed) return 0;
@@ -2805,6 +2973,13 @@ function computeTitleLabSlice(currentItems, periodLabel) {
         insight: null,
         hasEnoughData: false,
       },
+      titleFormatPerformance: {
+        formats: [],
+        channelMedianViews: 0,
+        bestFormatId: null,
+        insight: null,
+        hasEnoughData: false,
+      },
     };
   }
 
@@ -2825,6 +3000,7 @@ function computeTitleLabSlice(currentItems, periodLabel) {
     minWordCount: Math.min.apply(null, wordCounts),
     maxWordCount: Math.max.apply(null, wordCounts),
     titleLengthPerformance: buildTitleLengthPerformance(currentItems),
+    titleFormatPerformance: buildTitleFormatPerformance(currentItems),
   };
 }
 
@@ -4194,6 +4370,120 @@ function TitleLengthPerformanceBlock(props) {
   );
 }
 
+function TitleFormatPerformanceBlock(props) {
+  const data = props.data;
+  if (!data || !data.formats || !data.formats.length) return null;
+
+  const best = data.bestFormatId
+    ? data.formats.find(function (f) { return f.id === data.bestFormatId; })
+    : null;
+  const chartFormats = data.formats.filter(function (f) { return f.count > 0; });
+  const maxMedianViews = Math.max(1, chartFormats.reduce(function (max, f) {
+    return Math.max(max, f.medianViews);
+  }, 0));
+
+  return (
+    <div className="mt-5">
+      <InsightSectionTitle hint="Rule-based title format classification (no AI). Each video gets one primary format using regex patterns. Performance Index = format median views ÷ channel median views in this period.">
+        Title Format Performance
+      </InsightSectionTitle>
+
+      {best && (
+        <div className="mt-3 rounded-xl border border-emerald-200 bg-emerald-50/70 px-4 py-3">
+          <p className="text-[11px] font-semibold uppercase tracking-wide text-emerald-800">Best-performing format</p>
+          <p className="mt-1 text-sm font-semibold text-slate-900">
+            {best.label}
+            <span className="font-normal text-slate-600">
+              {" "}· {formatNumber(best.medianViews)} median views · {formatBreakoutMultiplier(best.performanceIndex)} channel median
+            </span>
+          </p>
+          <p className="mt-0.5 text-xs text-slate-600">{best.count} video{best.count === 1 ? "" : "s"} in this period</p>
+        </div>
+      )}
+
+      {data.insight && (
+        <p className={"mt-3 text-sm leading-relaxed " + (data.hasEnoughData ? "text-slate-700" : "text-slate-500")}>
+          {data.insight}
+        </p>
+      )}
+
+      <div className="mt-3 overflow-x-auto rounded-xl border border-slate-200">
+        <table className="min-w-full text-left text-sm">
+          <thead className="bg-slate-50 text-[11px] font-semibold uppercase tracking-wide text-slate-500">
+            <tr>
+              <th className="px-3 py-2.5">Format</th>
+              <th className="px-3 py-2.5 text-right">Videos</th>
+              <th className="px-3 py-2.5 text-right">Median views</th>
+              <th className="px-3 py-2.5 text-right">Avg views</th>
+              <th className="px-3 py-2.5 text-right">Median likes</th>
+              <th className="px-3 py-2.5 text-right">Median comments</th>
+              <th className="px-3 py-2.5 text-right">Engagement</th>
+              <th className="px-3 py-2.5 text-right">vs channel median</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-slate-100">
+            {data.formats.map(function (row) {
+              const isBest = row.id === data.bestFormatId;
+              return (
+                <tr key={row.id} className={isBest ? "bg-emerald-50/50" : "bg-white"}>
+                  <td className="px-3 py-2.5 font-medium text-slate-900">
+                    <span className="inline-flex flex-wrap items-center gap-1.5">
+                      <span>{row.label}</span>
+                      {row.limitedSample && (
+                        <span className="rounded-full bg-amber-50 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-amber-700">
+                          Limited sample
+                        </span>
+                      )}
+                    </span>
+                  </td>
+                  <td className="px-3 py-2.5 text-right text-slate-700">{row.count}</td>
+                  <td className="px-3 py-2.5 text-right font-semibold text-slate-900">{formatNumber(row.medianViews)}</td>
+                  <td className="px-3 py-2.5 text-right text-slate-700">{formatNumber(row.avgViews)}</td>
+                  <td className="px-3 py-2.5 text-right text-slate-700">{formatNumber(row.medianLikes)}</td>
+                  <td className="px-3 py-2.5 text-right text-slate-700">{formatNumber(row.medianComments)}</td>
+                  <td className="px-3 py-2.5 text-right text-slate-700">{formatPercent(row.engagementRate)}</td>
+                  <td className="px-3 py-2.5 text-right font-semibold text-slate-900">
+                    {row.performanceIndex > 0 ? formatBreakoutMultiplier(row.performanceIndex) : "—"}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+
+      {chartFormats.length > 0 && (
+        <div className="mt-4 rounded-xl bg-slate-50 p-3">
+          <div className="mb-2 flex items-center justify-between gap-2 text-[11px] text-slate-400">
+            <span>Format comparison (median views)</span>
+            <span>Channel median: {formatNumber(data.channelMedianViews)}</span>
+          </div>
+          <div className="space-y-2">
+            {chartFormats.map(function (row) {
+              const widthPct = maxMedianViews ? (row.medianViews / maxMedianViews) * 100 : 0;
+              const isBest = row.id === data.bestFormatId;
+              return (
+                <div key={row.id} className="grid grid-cols-[5.5rem_minmax(0,1fr)_3.5rem] items-center gap-2 sm:grid-cols-[7rem_minmax(0,1fr)_4rem]">
+                  <span className={"truncate text-[11px] font-medium " + (isBest ? "text-emerald-700" : "text-slate-600")}>
+                    {row.shortLabel}
+                  </span>
+                  <div className="h-2.5 overflow-hidden rounded-full bg-slate-200/80">
+                    <div
+                      className={"h-full rounded-full transition-all " + (isBest ? "bg-emerald-500" : "bg-slate-700")}
+                      style={{ width: Math.max(widthPct, row.medianViews > 0 ? 4 : 0) + "%" }}
+                    />
+                  </div>
+                  <span className="text-right text-[11px] font-semibold text-slate-700">{formatNumber(row.medianViews)}</span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function TitleLabPanel(props) {
   const titleLab = props.titleLab;
   const range = props.range;
@@ -4236,7 +4526,7 @@ function TitleLabPanel(props) {
     <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm sm:p-5">
       <PanelSectionHeader
         title={
-          <PanelTitle hint="Title length patterns and performance for videos in the selected period — character and word counts, length buckets, and which title-length range performs best. Filter by long-form, Shorts, or Live so formats are not mixed.">
+          <PanelTitle hint="Title length and format patterns for videos in the selected period — character counts, length buckets, rule-based title formats, and which styles perform best. Filter by long-form, Shorts, or Live so formats are not mixed.">
             Title Lab
           </PanelTitle>
         }
@@ -4295,6 +4585,7 @@ function TitleLabPanel(props) {
           </div>
 
           <TitleLengthPerformanceBlock data={active.titleLengthPerformance} />
+          <TitleFormatPerformanceBlock data={active.titleFormatPerformance} />
         </>
       )}
     </div>
