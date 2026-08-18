@@ -3692,7 +3692,8 @@ function ContentTopicsPanel(props) {
 
   if (!data) return null;
 
-  const canRunClassification = data.hasData && unclassifiedCount > 0 && props.canUseGemini !== false;
+  const hasTopicResults = data.topics && data.topics.length > 0;
+  const canRunClassification = data.hasData && unclassifiedCount > 0 && props.canUseGemini !== false && !hasTopicResults && !classifying;
   const geminiDisabled = props.canUseGemini === false && unclassifiedCount > 0;
 
   return (
@@ -3779,7 +3780,7 @@ function ContentTopicsPanel(props) {
             {!data.classificationComplete && data.pendingCount > 0 && (
               <p className="mt-1 text-[11px] text-slate-500">
                 Showing {data.classifiedCount} classified video{data.classifiedCount === 1 ? "" : "s"} · {data.pendingCount} unclassified
-                {!classifying && canRunClassification ? " — click Run to classify the rest" : (classifying ? " · classifying…" : (geminiDisabled ? " · AI analysis is currently disabled" : ""))}
+                {classifying ? " · classifying…" : (geminiDisabled ? " · AI analysis is currently disabled" : "")}
               </p>
             )}
             {data.topics.some(function (t) { return t.performanceTier !== "average"; }) && (
