@@ -126,6 +126,7 @@ function apiResponseToCacheEntry(data) {
     videoIds: data.videoIds || (data.rawVideos || []).map(function (v) { return v.id; }),
     rawVideos: data.rawVideos || [],
     topicClassifications: data.topicClassifications || {},
+    titleFormatClassifications: data.titleFormatClassifications || {},
   };
 }
 
@@ -144,6 +145,23 @@ async function saveTopicClassificationsToApi(channelId, classifications) {
     body: { classifications: payload },
   });
   return data.topicClassifications || null;
+}
+
+async function fetchTitleFormatClassificationsFromApi(channelId) {
+  if (!API_BASE || !getStoredAuthToken() || !channelId) return {};
+  const data = await apiRequest("/channels/" + encodeURIComponent(channelId) + "/title-format-classifications");
+  return data.titleFormatClassifications || {};
+}
+
+async function saveTitleFormatClassificationsToApi(channelId, classifications) {
+  if (!API_BASE || !getStoredAuthToken() || !channelId) return null;
+  const payload = classifications || {};
+  if (!Object.keys(payload).length) return null;
+  const data = await apiRequest("/channels/" + encodeURIComponent(channelId) + "/title-format-classifications", {
+    method: "PUT",
+    body: { classifications: payload },
+  });
+  return data.titleFormatClassifications || null;
 }
 
 async function logGeminiUsageToApi(channelId, model, videosClassified) {
@@ -178,6 +196,27 @@ async function applyTopicClassificationsToVideos(channelId, videos, topicMap) {
     video.topicClassification = classification;
     if (mem) mem.topicClassifications[videoId] = classification;
     await saveVideoTopicClassification(channelId, videoId, classification, { skipApi: true });
+    applied++;
+  }
+  return applied;
+}
+
+async function applyTitleFormatClassificationsToVideos(channelId, videos, formatMap) {
+  if (!videos || !videos.length || !formatMap) return 0;
+  let applied = 0;
+  const mem = memoryChannelCache.get(channelId);
+  if (mem && !mem.titleFormatClassifications) mem.titleFormatClassifications = {};
+
+  for (let i = 0; i < videos.length; i++) {
+    const video = videos[i];
+    const videoId = video.id || video.videoId;
+    if (!videoId) continue;
+    const classification = formatMap[videoId];
+    if (!isValidTitleFormatClassification(classification)) continue;
+    if (isValidTitleFormatClassification(video.titleFormatClassification)) continue;
+    video.titleFormatClassification = classification;
+    if (mem) mem.titleFormatClassifications[videoId] = classification;
+    await saveVideoTitleFormatClassification(channelId, videoId, classification, { skipApi: true });
     applied++;
   }
   return applied;
@@ -218,6 +257,41 @@ async function hydrateTopicClassificationsForEntry(entry) {
   return entry;
 }
 
+async function hydrateTitleFormatClassificationsForEntry(entry) {
+  if (!entry || !entry.channelId) return entry;
+
+  let serverMap = entry.titleFormatClassifications || {};
+  if (API_BASE && getStoredAuthToken()) {
+    try {
+      const apiMap = await fetchTitleFormatClassificationsFromApi(entry.channelId);
+      serverMap = Object.assign({}, serverMap, apiMap);
+    } catch (e) {
+      console.warn("Could not load title format classifications from server:", e);
+    }
+  }
+
+  try {
+    const local = await loadChannelCache(entry.channelId);
+    const localMap = (local && local.titleFormatClassifications) ? local.titleFormatClassifications : {};
+    entry.titleFormatClassifications = Object.assign({}, localMap, serverMap);
+  } catch (e) {
+    entry.titleFormatClassifications = serverMap;
+  }
+
+  if (entry.rawVideos && entry.rawVideos.length && entry.titleFormatClassifications) {
+    entry.rawVideos.forEach(function (raw) {
+      if (!raw || !raw.id) return;
+      const classification = entry.titleFormatClassifications[raw.id];
+      if (isValidTitleFormatClassification(classification)) {
+        raw.titleFormatClassification = classification;
+      }
+    });
+  }
+
+  memoryChannelCache.set(entry.channelId, entry);
+  return entry;
+}
+
 async function mergeTopicClassificationsFromCache(entry) {
   entry = await hydrateTopicClassificationsForEntry(entry);
 
@@ -238,6 +312,34 @@ async function mergeTopicClassificationsFromCache(entry) {
         if (merged) {
           entry.topicClassifications = Object.assign({}, entry.topicClassifications || {}, merged);
           await hydrateTopicClassificationsForEntry(entry);
+        }
+      }
+    } catch (e) { /* keep merged entry */ }
+  }
+
+  return entry;
+}
+
+async function mergeTitleFormatClassificationsFromCache(entry) {
+  entry = await hydrateTitleFormatClassificationsForEntry(entry);
+
+  if (API_BASE && getStoredAuthToken() && entry.channelId) {
+    try {
+      const local = await loadChannelCache(entry.channelId);
+      const localMap = (local && local.titleFormatClassifications) ? local.titleFormatClassifications : {};
+      const serverMap = entry.titleFormatClassifications || {};
+      const toUpload = {};
+      Object.keys(localMap).forEach(function (videoId) {
+        const localClass = localMap[videoId];
+        if (isValidTitleFormatClassification(localClass) && !isValidTitleFormatClassification(serverMap[videoId])) {
+          toUpload[videoId] = localClass;
+        }
+      });
+      if (Object.keys(toUpload).length) {
+        const merged = await saveTitleFormatClassificationsToApi(entry.channelId, toUpload);
+        if (merged) {
+          entry.titleFormatClassifications = Object.assign({}, entry.titleFormatClassifications || {}, merged);
+          await hydrateTitleFormatClassificationsForEntry(entry);
         }
       }
     } catch (e) { /* keep merged entry */ }
@@ -358,6 +460,7 @@ const GEMINI_BATCH_SIZE = 8;
 const GEMINI_BATCH_DELAY_MS = 1500;
 const GEMINI_RETRY_DELAYS_MS = [2000, 5000, 12000];
 const TOPIC_CLASSIFICATION_VERSION = 1;
+const TITLE_FORMAT_CLASSIFICATION_VERSION = 1;
 const TOPIC_OTHER_MAX_SHARE = 0.2;
 const MAX_PLAYLIST_PAGES = null; // null = fetch entire upload history
 const FAVORITES_KEY = "ytca-favorites";
@@ -556,10 +659,14 @@ function assembleCacheEntry(channelMeta, videoRecords) {
   if (!channelMeta || channelMeta.version !== CACHE_VERSION) return null;
   const videoMap = {};
   const topicClassifications = Object.assign({}, channelMeta.topicClassifications || {});
+  const titleFormatClassifications = Object.assign({}, channelMeta.titleFormatClassifications || {});
   (videoRecords || []).forEach(function (record) {
     if (record && record.videoId && record.raw) videoMap[record.videoId] = record.raw;
     if (record && record.videoId && record.topicClassification) {
       topicClassifications[record.videoId] = record.topicClassification;
+    }
+    if (record && record.videoId && record.titleFormatClassification) {
+      titleFormatClassifications[record.videoId] = record.titleFormatClassification;
     }
   });
   const videoIds = channelMeta.videoIds || [];
@@ -574,6 +681,7 @@ function assembleCacheEntry(channelMeta, videoRecords) {
     videoIds: videoIds,
     rawVideos: rawVideos,
     topicClassifications: topicClassifications,
+    titleFormatClassifications: titleFormatClassifications,
   };
 }
 
@@ -586,6 +694,7 @@ function toChannelMeta(entry) {
     videoIds: entry.videoIds || entry.rawVideos.map(function (v) { return v.id; }),
     lastSyncedAt: lastSyncedAt,
     topicClassifications: entry.topicClassifications || {},
+    titleFormatClassifications: entry.titleFormatClassifications || {},
   };
 }
 
@@ -623,9 +732,10 @@ async function loadChannelCache(channelId) {
   }
 }
 
-async function putVideoRecords(store, channelId, rawVideos, existingByVideoId, topicClassifications) {
+async function putVideoRecords(store, channelId, rawVideos, existingByVideoId, topicClassifications, titleFormatClassifications) {
   const existingMap = existingByVideoId || {};
   const topicMap = topicClassifications || {};
+  const titleFormatMap = titleFormatClassifications || {};
   for (let i = 0; i < rawVideos.length; i++) {
     const raw = compactRawVideo(rawVideos[i]);
     if (!raw || !raw.id) continue;
@@ -643,11 +753,17 @@ async function putVideoRecords(store, channelId, rawVideos, existingByVideoId, t
     if (isValidTopicClassification(topicMap[raw.id])) {
       record.topicClassification = topicMap[raw.id];
     }
+    if (existing && existing.titleFormatClassification) {
+      record.titleFormatClassification = existing.titleFormatClassification;
+    }
+    if (isValidTitleFormatClassification(titleFormatMap[raw.id])) {
+      record.titleFormatClassification = titleFormatMap[raw.id];
+    }
     await idbRequest(store.put(record));
   }
 }
 
-async function saveChannelVideos(channelId, rawVideos, topicClassifications) {
+async function saveChannelVideos(channelId, rawVideos, topicClassifications, titleFormatClassifications) {
   if (!rawVideos || !rawVideos.length) return;
   const db = await openChannelCacheDb();
   const tx = db.transaction(VIDEO_STORE, "readwrite");
@@ -658,7 +774,7 @@ async function saveChannelVideos(channelId, rawVideos, topicClassifications) {
   (existingRecords || []).forEach(function (record) {
     if (record && record.videoId) existingByVideoId[record.videoId] = record;
   });
-  await putVideoRecords(store, channelId, rawVideos, existingByVideoId, topicClassifications);
+  await putVideoRecords(store, channelId, rawVideos, existingByVideoId, topicClassifications, titleFormatClassifications);
   await waitTransaction(tx);
 }
 
@@ -685,6 +801,32 @@ async function saveVideoTopicClassification(channelId, videoId, classification, 
   if (mem) {
     if (!mem.topicClassifications) mem.topicClassifications = {};
     mem.topicClassifications[videoId] = classification;
+  }
+  return true;
+}
+
+async function saveVideoTitleFormatClassification(channelId, videoId, classification, options) {
+  const db = await openChannelCacheDb();
+  const key = videoRecordKey(channelId, videoId);
+  const tx = db.transaction(VIDEO_STORE, "readwrite");
+  const store = tx.objectStore(VIDEO_STORE);
+  const existing = await idbRequest(store.get(key));
+  if (!existing) {
+    const mem = memoryChannelCache.get(channelId);
+    if (mem) {
+      if (!mem.titleFormatClassifications) mem.titleFormatClassifications = {};
+      mem.titleFormatClassifications[videoId] = classification;
+    }
+    await waitTransaction(tx);
+    return false;
+  }
+  existing.titleFormatClassification = classification;
+  await idbRequest(store.put(existing));
+  await waitTransaction(tx);
+  const mem = memoryChannelCache.get(channelId);
+  if (mem) {
+    if (!mem.titleFormatClassifications) mem.titleFormatClassifications = {};
+    mem.titleFormatClassifications[videoId] = classification;
   }
   return true;
 }
@@ -718,11 +860,15 @@ async function saveChannelCache(entry) {
 
   const channelMeta = toChannelMeta(normalized);
   await saveChannelMeta(channelMeta);
-  await saveChannelVideos(normalized.channelId, normalized.rawVideos, entry.topicClassifications);
+  await saveChannelVideos(normalized.channelId, normalized.rawVideos, entry.topicClassifications, entry.titleFormatClassifications);
   memoryChannelCache.set(normalized.channelId, Object.assign({}, normalized, {
     topicClassifications: entry.topicClassifications || {},
+    titleFormatClassifications: entry.titleFormatClassifications || {},
   }));
-  return Object.assign({}, normalized, { topicClassifications: entry.topicClassifications || {} });
+  return Object.assign({}, normalized, {
+    topicClassifications: entry.topicClassifications || {},
+    titleFormatClassifications: entry.titleFormatClassifications || {},
+  });
 }
 
 async function appendChannelVideos(channelId, channelMeta, newRawVideos) {
@@ -795,8 +941,13 @@ function isCacheFresh(entry) {
 
 function buildResultFromCache(entry) {
   const topicClassifications = entry.topicClassifications || {};
+  const titleFormatClassifications = entry.titleFormatClassifications || {};
   const classified = entry.rawVideos.map(function (v) {
-    return classifyVideo(v, topicClassifications[v.id] || null);
+    return classifyVideo(
+      v,
+      topicClassifications[v.id] || null,
+      titleFormatClassifications[v.id] || null
+    );
   });
   return {
     channel: entry.channel,
@@ -1135,7 +1286,7 @@ async function refreshChannelCache(apiKey, cacheEntry, onProgress) {
 
 // ---------- channel publishing behavior (plain JS) ----------
 
-function classifyVideo(v, topicClassification) {
+function classifyVideo(v, topicClassification, titleFormatClassification) {
   const durationSec = parseDurationSeconds(v.contentDetails.duration);
   const isLive = !!(v.liveStreamingDetails && v.liveStreamingDetails.actualStartTime);
   const category = isLive ? "live" : (durationSec <= 60 ? "short" : "long");
@@ -1154,6 +1305,7 @@ function classifyVideo(v, topicClassification) {
     likeCount: Number(stats.likeCount) || 0,
     commentCount: Number(stats.commentCount) || 0,
     topicClassification: topicClassification || null,
+    titleFormatClassification: titleFormatClassification || null,
   };
 }
 
@@ -2415,6 +2567,211 @@ async function classifyVideosWithGemini(channelId, videos, options) {
   };
 }
 
+function isValidTitleFormatClassification(c) {
+  return !!(c && c.version === TITLE_FORMAT_CLASSIFICATION_VERSION && c.primaryFormat && typeof c.confidence === "number");
+}
+
+function normalizeTitleFormatLabel(name) {
+  return (name || "").trim().replace(/\s+/g, " ");
+}
+
+function titleFormatSlug(name) {
+  return (name || "format").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "format";
+}
+
+function titleFormatShortLabel(name) {
+  const label = normalizeTitleFormatLabel(name);
+  if (label.length <= 14) return label;
+  return label.slice(0, 13) + "…";
+}
+
+function mergeTitleFormatCharacteristics(title, rawCharacteristics) {
+  const local = extractTitleCharacteristics(title);
+  const ai = rawCharacteristics && typeof rawCharacteristics === "object" ? rawCharacteristics : {};
+  return {
+    has_question: !!(ai.has_question || local.has_question),
+    has_number: !!(ai.has_number || local.has_number),
+    has_vs: !!(ai.has_vs || local.has_vs),
+    has_colon: !!(ai.has_colon || local.has_colon),
+    has_brackets: !!(ai.has_brackets || local.has_brackets),
+    has_parentheses: !!(ai.has_parentheses || local.has_parentheses),
+    has_first_person: !!(ai.has_first_person || local.has_first_person),
+    has_list_pattern: !!(ai.has_list_pattern || local.has_list_pattern),
+    has_tutorial_signal: !!(ai.has_tutorial_signal || local.has_tutorial_signal),
+    has_news_signal: !!(ai.has_news_signal || local.has_news_signal),
+    has_story_signal: !!(ai.has_story_signal || local.has_story_signal),
+  };
+}
+
+function normalizeTitleFormatClassification(raw, title) {
+  if (!raw || !raw.primaryFormat) return null;
+  const primary = normalizeTitleFormatLabel(raw.primaryFormat);
+  if (!primary) return null;
+  return {
+    version: TITLE_FORMAT_CLASSIFICATION_VERSION,
+    primaryFormat: primary,
+    characteristics: mergeTitleFormatCharacteristics(title, raw.characteristics),
+    confidence: Math.min(1, Math.max(0, Number(raw.confidence) || 0.5)),
+    classifiedAt: raw.classifiedAt || new Date().toISOString(),
+  };
+}
+
+function buildGeminiTitleFormatPrompt(videos, existingFormats) {
+  const formatList = existingFormats.length ? existingFormats.join(", ") : "none yet";
+  const payload = videos.map(function (v) {
+    return {
+      videoId: v.id,
+      title: v.title,
+    };
+  });
+  return [
+    "You classify YouTube video TITLES into meaningful title format/pattern categories for channel analytics.",
+    "",
+    "Rules:",
+    "- Return ONE primaryFormat per video based on the title's meaning, structure, and intent.",
+    "- Do NOT restrict yourself to a fixed list. Choose the most useful, concise format label for each title.",
+    "- Focus on title PATTERN / FORMAT (how the title is written), not the video topic/subject.",
+    "- Examples: How-to Tutorial, Question Hook, Numbered List, Product Comparison, Review, Guide, Best/Top Picks, Personal Experiment, Breaking News, Announcement, Problem/Solution, Reasons/Why, Explainer, Opinion, Prediction, Case Study, Challenge, Mistakes/Warnings, Tips, Beginner Intro, Deep Dive, Ranking, Reaction, Documentary Story, Personal Story, etc.",
+    "- Reuse existing format labels when they fit: " + formatList,
+    "- Use identical primaryFormat strings for similar title structures. Avoid near-duplicate synonyms.",
+    "- Keep the channel's format taxonomy practical (about 5-15 distinct formats when possible).",
+    "- characteristics: booleans for has_question, has_number, has_vs, has_colon, has_brackets, has_parentheses, has_first_person",
+    "- confidence: 0.0 to 1.0",
+    "",
+    "Return ONLY a JSON array:",
+    '[{"videoId":"id","primaryFormat":"How-to Tutorial","characteristics":{"has_question":false,"has_number":false,"has_vs":false,"has_colon":false,"has_brackets":false,"has_parentheses":false,"has_first_person":true},"confidence":0.92}]',
+    "",
+    "Videos:",
+    JSON.stringify(payload),
+  ].join("\n");
+}
+
+async function classifyTitleFormatsWithGemini(channelId, videos, options) {
+  const opts = options || {};
+  if (opts.canUseGemini === false) {
+    const err = new Error("AI title format analysis is currently turned off for users. Please contact an admin.");
+    err.code = "GEMINI_DISABLED";
+    throw err;
+  }
+  const priorityIds = opts.priorityIds || {};
+  const onProgress = opts.onProgress;
+  const periodOnly = opts.periodOnly !== false;
+
+  let loadedFromCache = 0;
+  if (channelId) {
+    let formatMap = {};
+    if (API_BASE && getStoredAuthToken()) {
+      try {
+        formatMap = await fetchTitleFormatClassificationsFromApi(channelId);
+      } catch (e) {
+        console.warn("Could not load cached title format classifications:", e);
+      }
+    } else {
+      const entry = loadChannelCacheSync(channelId) || memoryChannelCache.get(channelId);
+      formatMap = entry && entry.titleFormatClassifications ? entry.titleFormatClassifications : {};
+    }
+    loadedFromCache = await applyTitleFormatClassificationsToVideos(channelId, videos, formatMap);
+  }
+
+  let unclassified = videos.filter(function (v) {
+    return !isValidTitleFormatClassification(v.titleFormatClassification);
+  });
+
+  if (periodOnly && Object.keys(priorityIds).length) {
+    unclassified = unclassified.filter(function (v) { return !!priorityIds[v.id]; });
+  }
+
+  unclassified.sort(function (a, b) {
+    return (priorityIds[b.id] ? 1 : 0) - (priorityIds[a.id] ? 1 : 0);
+  });
+
+  if (!unclassified.length) {
+    if (onProgress) onProgress(0, 0);
+    return {
+      classified: 0,
+      total: 0,
+      loadedFromCache: loadedFromCache,
+      stoppedEarly: false,
+    };
+  }
+
+  const existingFormats = {};
+  videos.forEach(function (v) {
+    if (isValidTitleFormatClassification(v.titleFormatClassification)) {
+      existingFormats[v.titleFormatClassification.primaryFormat] = true;
+    }
+  });
+  let formatList = Object.keys(existingFormats);
+  let classified = 0;
+  let stoppedEarly = false;
+  let stopReason = null;
+
+  for (let i = 0; i < unclassified.length; i += GEMINI_BATCH_SIZE) {
+    const batch = unclassified.slice(i, i + GEMINI_BATCH_SIZE);
+    if (onProgress) {
+      if (i === 0) onProgress(0, unclassified.length);
+      else onProgress(classified, unclassified.length);
+    }
+
+    let results;
+    let modelUsed = null;
+    try {
+      const geminiResponse = await callGeminiJson(buildGeminiTitleFormatPrompt(batch, formatList));
+      results = geminiResponse.results;
+      modelUsed = geminiResponse.model;
+    } catch (e) {
+      if (e && (e.status === 429 || e.status === 503) && classified > 0) {
+        stoppedEarly = true;
+        stopReason = e.message;
+        break;
+      }
+      throw e;
+    }
+
+    const resultMap = {};
+    results.forEach(function (row) {
+      if (row && row.videoId) resultMap[row.videoId] = row;
+    });
+
+    const batchSaved = {};
+    for (let j = 0; j < batch.length; j++) {
+      const video = batch[j];
+      const row = resultMap[video.id];
+      if (!row) continue;
+      const classification = normalizeTitleFormatClassification(row, video.title);
+      if (!classification) continue;
+      await saveVideoTitleFormatClassification(channelId, video.id, classification, { skipApi: true });
+      video.titleFormatClassification = classification;
+      batchSaved[video.id] = classification;
+      existingFormats[classification.primaryFormat] = true;
+      formatList = Object.keys(existingFormats);
+      classified++;
+    }
+
+    if (Object.keys(batchSaved).length) {
+      try {
+        await saveTitleFormatClassificationsToApi(channelId, batchSaved);
+      } catch (e) {
+        console.warn("Could not save title format classifications to server:", e);
+      }
+      logGeminiUsageToApi(channelId, modelUsed, Object.keys(batchSaved).length);
+    }
+
+    if (i + GEMINI_BATCH_SIZE < unclassified.length) {
+      await sleepMs(GEMINI_BATCH_DELAY_MS);
+    }
+  }
+
+  if (onProgress) onProgress(classified, unclassified.length);
+  return {
+    classified: classified,
+    total: unclassified.length,
+    loadedFromCache: loadedFromCache,
+    stoppedEarly: stoppedEarly,
+    stopReason: stopReason,
+  };
+}
+
 function groupVideosByAiTopic(videos, totalVideos) {
   const groups = {};
   videos.forEach(function (video) {
@@ -2775,62 +3132,10 @@ function buildTitleLengthInsight(buckets, totalVideos) {
   };
 }
 
-const TITLE_FORMAT_DEFS = [
-  { id: "how-to", label: "How-to", shortLabel: "How-to" },
-  { id: "question", label: "Question", shortLabel: "Question" },
-  { id: "list-number", label: "List/Number", shortLabel: "List" },
-  { id: "comparison", label: "Comparison", shortLabel: "Compare" },
-  { id: "review", label: "Review", shortLabel: "Review" },
-  { id: "guide", label: "Guide", shortLabel: "Guide" },
-  { id: "best-top", label: "Best/Top", shortLabel: "Best/Top" },
-  { id: "experience", label: "Experience/Experiment", shortLabel: "Experience" },
-  { id: "news-update", label: "News/Update", shortLabel: "News" },
-  { id: "personal-story", label: "Story / Personal Story", shortLabel: "Story" },
-  { id: "announcement", label: "Announcement", shortLabel: "Announce" },
-  { id: "problem-solution", label: "Problem / Solution", shortLabel: "Problem" },
-  { id: "reasons-why", label: "Reasons / Why", shortLabel: "Reasons" },
-  { id: "educational", label: "Educational / Explainer", shortLabel: "Explain" },
-  { id: "opinion", label: "Opinion / Commentary", shortLabel: "Opinion" },
-  { id: "prediction", label: "Prediction / Future", shortLabel: "Predict" },
-  { id: "case-study", label: "Case Study / Breakdown", shortLabel: "Case" },
-  { id: "challenge", label: "Challenge", shortLabel: "Challenge" },
-  { id: "mistakes-warnings", label: "Mistakes / Warnings", shortLabel: "Mistakes" },
-  { id: "tips-advice", label: "Tips / Advice", shortLabel: "Tips" },
-  { id: "beginner", label: "Beginner / Starter", shortLabel: "Beginner" },
-  { id: "deep-dive", label: "Deep Dive / Analysis", shortLabel: "Deep dive" },
-  { id: "ranking", label: "Ranking", shortLabel: "Ranking" },
-  { id: "reaction", label: "Reaction", shortLabel: "Reaction" },
-  { id: "documentary", label: "Documentary / Story", shortLabel: "Doc" },
-  { id: "other", label: "Other", shortLabel: "Other" },
-];
 const TITLE_FORMAT_MIN_INSIGHT_VIDEOS = 3;
 
 function normalizeTitleForFormatClassification(title) {
   return (title || "").trim().replace(/\s+/g, " ");
-}
-
-function titleFormatWordCount(title) {
-  return normalizeTitleForFormatClassification(title).split(/\s+/).filter(Boolean).length;
-}
-
-function titleHasPhrase(title, pattern) {
-  return pattern.test(normalizeTitleForFormatClassification(title));
-}
-
-function titleHasAnyPhrase(title, patterns) {
-  return patterns.some(function (pattern) { return titleHasPhrase(title, pattern); });
-}
-
-function titleSignalCount(title, patterns) {
-  let count = 0;
-  patterns.forEach(function (pattern) {
-    if (titleHasPhrase(title, pattern)) count++;
-  });
-  return count;
-}
-
-function titleHasFirstPerson(title) {
-  return /\b(i|my|me|we|our|i'm|i've|i'll|we're|we've)\b/i.test(normalizeTitleForFormatClassification(title));
 }
 
 function extractTitleCharacteristics(title) {
@@ -2843,7 +3148,7 @@ function extractTitleCharacteristics(title) {
     has_colon: /:/.test(t),
     has_brackets: /\[|\]/.test(t),
     has_parentheses: /\(|\)/.test(t),
-    has_first_person: titleHasFirstPerson(t),
+    has_first_person: /\b(i|my|me|we|our|i'm|i've|i'll|we're|we've)\b/i.test(t),
     has_list_pattern: /^\d+[\).\s:-]/.test(t) || /\b\d+\s+(ways|tips|tools|reasons|things|steps|ideas|secrets|mistakes|hacks|tricks)\b/i.test(t),
     has_tutorial_signal: /\b(tutorial|step[\s-]by[\s-]step|how\s+to)\b/i.test(t),
     has_news_signal: /\b(breaking|latest|update|announced|released|news)\b/i.test(lower),
@@ -2851,168 +3156,10 @@ function extractTitleCharacteristics(title) {
   };
 }
 
-function classifyTitleFormat(title) {
-  const t = normalizeTitleForFormatClassification(title);
-  if (!t) return "other";
-
-  const words = titleFormatWordCount(t);
-  const firstPerson = titleHasFirstPerson(t);
-
-  if (titleHasAnyPhrase(t, [/\bvs\.?\b/i, /\bversus\b/i]) && words >= 3) {
-    return "comparison";
-  }
-
-  if (
-    titleHasAnyPhrase(t, [/\b\d+\s*(-\s*)?day\s+challenge\b/i, /\b\d+\s+week\s+challenge\b/i]) ||
-    (titleHasPhrase(t, /\bchallenge\b/i) && (titleHasPhrase(t, /\bfor\s+\d+\s+days\b/i) || firstPerson) && words >= 4)
-  ) {
-    return "challenge";
-  }
-
-  if (titleHasAnyPhrase(t, [/\breaction\s+to\b/i, /\breacts?\s+to\b/i, /\breacting\s+to\b/i, /\bmy\s+reaction\b/i]) && words >= 3) {
-    return "reaction";
-  }
-
-  if (titleHasAnyPhrase(t, [/\btier\s+list\b/i, /\branking\b/i, /\branked\b/i, /\bpower\s+ranking\b/i, /\bevery\s+.+\s+ranked\b/i]) && words >= 3) {
-    return "ranking";
-  }
-
-  if (titleHasAnyPhrase(t, [/\bdocumentary\b/i, /\bthe\s+story\s+of\b/i, /\bstory\s+of\s+the\b/i]) && words >= 4) {
-    return "documentary";
-  }
-
-  if (titleHasAnyPhrase(t, [/\bcase\s+study\b/i, /\bbreakdown\s+of\b/i, /\bfull\s+breakdown\b/i, /\binside\s+the\b/i]) && words >= 4) {
-    return "case-study";
-  }
-
-  if (titleHasAnyPhrase(t, [/\bdeep\s+dive\b/i, /\bin[\s-]depth\s+analysis\b/i, /\bfull\s+analysis\b/i, /\banalyzing\b/i, /\banalysis\s+of\b/i]) && words >= 4) {
-    return "deep-dive";
-  }
-
-  if (
-    titleHasPhrase(t, /\bmy\s+story\b/i) ||
-    (firstPerson && titleHasAnyPhrase(t, [/\bwhat\s+happened\s+when\b/i, /\bwhat\s+happened\s+to\b/i, /\bmy\s+journey\b/i, /\bconfession\b/i]) && words >= 5)
-  ) {
-    return "personal-story";
-  }
-
-  if (
-    firstPerson &&
-    titleHasAnyPhrase(t, [/\bi\s+tried\b/i, /\bi\s+tested\b/i, /\bi\s+used\b/i, /\bi\s+built\b/i, /\bi\s+spent\b/i, /\bi\s+learned\b/i, /\bexperiment\b/i, /\bi\s+quit\b/i]) &&
-    words >= 4
-  ) {
-    return "experience";
-  }
-
-  if (
-    titleHasAnyPhrase(t, [/\bhow\s+to\b/i, /\btutorial\b/i, /\bstep[\s-]by[\s-]step\b/i]) ||
-    (titleHasAnyPhrase(t, [/\bhow\s+i\b/i, /\bhow\s+we\b/i, /\bhow\s+do\s+i\b/i]) && words >= 5)
-  ) {
-    return "how-to";
-  }
-
-  if (
-    (titleHasAnyPhrase(t, [/\bsolution\s+to\b/i, /\bhow\s+to\s+fix\b/i, /\bproblem\s+with\b/i, /\bfix\s+this\b/i]) &&
-      titleHasAnyPhrase(t, [/\bproblem\b/i, /\bissue\b/i, /\berror\b/i, /\bfix\b/i, /\bsolution\b/i, /\bworkaround\b/i, /\btroubleshoot\b/i])) ||
-    titleHasPhrase(t, /\bproblem\s+.+\s+solution\b/i)
-  ) {
-    return "problem-solution";
-  }
-
-  if (
-    /\?\s*$/.test(t) ||
-    (/^(why|what|how|is|are|can|should|will|does|do|did|was|were|could|would)\b/i.test(t) && words >= 4 && !titleHasPhrase(t, /\bhow\s+to\b/i))
-  ) {
-    return "question";
-  }
-
-  if (
-    titleHasAnyPhrase(t, [/\breasons\s+why\b/i, /\breasons\s+to\b/i, /\breasons\s+not\s+to\b/i, /\bwhy\s+i\b/i, /\bwhy\s+you\b/i, /\bwhy\s+we\b/i, /\bwhy\s+this\b/i]) &&
-    words >= 4 &&
-    !/\?\s*$/.test(t)
-  ) {
-    return "reasons-why";
-  }
-
-  if (
-    titleSignalCount(t, [/\bmistake/i, /\bwarning/i, /\bdon'?t\b/i, /\bnever\b/i, /\bavoid\b/i, /\bstop\b/i]) >= 2 ||
-    titleHasAnyPhrase(t, [/\bmistakes\s+(to\s+)?avoid\b/i, /\bnever\s+do\b/i, /\bwarning\b/i])
-  ) {
-    return "mistakes-warnings";
-  }
-
-  if (titleHasAnyPhrase(t, [/\btips\s+for\b/i, /\btips\s+to\b/i, /\badvice\s+for\b/i, /\bpro\s+tips\b/i, /\bquick\s+tips\b/i, /\bexpert\s+tips\b/i]) && words >= 4) {
-    return "tips-advice";
-  }
-
-  if (
-    /^\d+[\).\s:-]/.test(t) ||
-    /^\d+\s+(best|top|ways|tips|tools|reasons|things|steps|ideas|secrets|mistakes|hacks|tricks|methods|apps|rules|facts|signs|benefits|uses|features|examples|lessons)\b/i.test(t) ||
-    (titleHasPhrase(t, /\b\d+\s+(ways|tips|tools|reasons|things|steps|ideas|secrets|mistakes|hacks|tricks)\b/i) && words >= 5)
-  ) {
-    return "list-number";
-  }
-
-  if (/^(best|top)\b/i.test(t) && words >= 3 && !/^\d/.test(t)) {
-    return "best-top";
-  }
-
-  if (
-    titleHasAnyPhrase(t, [/\breview\b/i, /\btested\b/i, /\btesting\b/i, /\bhands[\s-]?on\b/i, /\bunboxing\b/i, /\bfirst\s+impressions?\b/i, /\bafter\s+\d+\s+(days|weeks|months)\b/i]) &&
-    words >= 3
-  ) {
-    return "review";
-  }
-
-  if (
-    titleHasAnyPhrase(t, [/\bcomplete\s+guide\b/i, /\bultimate\s+guide\b/i, /\bbeginner'?s?\s+guide\b/i, /\bthe\s+only\s+guide\b/i, /\bguide\s+to\b/i]) ||
-    (titleHasPhrase(t, /\bguide\b/i) && words >= 4)
-  ) {
-    return "guide";
-  }
-
-  if (titleHasAnyPhrase(t, [/\bfor\s+beginners\b/i, /\bbeginner\s+friendly\b/i, /\bstarter\s+guide\b/i, /\bgetting\s+started\b/i, /\bintro\s+to\b/i, /\bstart\s+here\b/i]) && words >= 4) {
-    return "beginner";
-  }
-
-  if (
-    titleHasAnyPhrase(t, [/\bexplained\b/i, /\beverything\s+you\s+need\s+to\s+know\b/i, /\bwhat\s+is\b/i, /\bwhat\s+are\b/i, /\bcrash\s+course\b/i, /\blearn\b/i]) &&
-    words >= 4 &&
-    !titleHasPhrase(t, /\bhow\s+to\b/i)
-  ) {
-    return "educational";
-  }
-
-  if (
-    titleHasAnyPhrase(t, [/\bunpopular\s+opinion\b/i, /\bhot\s+take\b/i, /\bmy\s+opinion\b/i, /\bi\s+think\b/i, /\btruth\s+about\b/i, /\bcommentary\b/i]) &&
-    (firstPerson || words >= 4)
-  ) {
-    return "opinion";
-  }
-
-  if (titleHasAnyPhrase(t, [/\bfuture\s+of\b/i, /\bpredictions?\b/i, /\bwhat'?s\s+next\b/i, /\bin\s+20\d{2}\b/i, /\bwill\s+change\b/i, /\bcoming\s+soon\b/i, /\bnext\s+decade\b/i]) && words >= 4) {
-    return "prediction";
-  }
-
-  if (titleHasAnyPhrase(t, [/\bannouncing\b/i, /\bwe'?re\s+launching\b/i, /\bintroducing\b/i, /\bbig\s+announcement\b/i, /\bofficial\s+announcement\b/i, /\bi'?m\s+launching\b/i]) && words >= 3) {
-    return "announcement";
-  }
-
-  if (
-    titleHasAnyPhrase(t, [/\bbreaking\b/i, /\blatest\s+news\b/i, /\bjust\s+announced\b/i, /\bjust\s+released\b/i, /\bnews\s+update\b/i, /\bupdate\s+on\b/i, /\bofficial\s+update\b/i]) ||
-    (titleSignalCount(t, [/\blatest\b/i, /\bupdate\b/i, /\bnew\b/i, /\bnews\b/i, /\breleased\b/i, /\bannounced\b/i]) >= 2 && words >= 4)
-  ) {
-    return "news-update";
-  }
-
-  return "other";
-}
-
-function classifyVideoTitle(title) {
-  return {
-    primaryFormat: classifyTitleFormat(title),
-    characteristics: extractTitleCharacteristics(title),
-  };
+function getVideoTitleFormatLabel(video) {
+  const c = video && video.titleFormatClassification;
+  if (!isValidTitleFormatClassification(c)) return null;
+  return normalizeTitleFormatLabel(c.primaryFormat);
 }
 
 function buildTitleFormatPerformance(items) {
@@ -3023,17 +3170,39 @@ function buildTitleFormatPerformance(items) {
       bestFormatId: null,
       insight: null,
       hasEnoughData: false,
+      classifiedCount: 0,
+      pendingCount: 0,
     };
   }
 
   const channelViews = items.map(function (v) { return v.viewCount || 0; });
   const channelMedianViews = medianValue(channelViews);
-  const groups = {};
-  TITLE_FORMAT_DEFS.forEach(function (def) { groups[def.id] = []; });
+  const classifiedItems = items.filter(function (v) {
+    return isValidTitleFormatClassification(v.titleFormatClassification);
+  });
+  const pendingCount = items.length - classifiedItems.length;
 
-  items.forEach(function (video) {
-    const classified = classifyVideoTitle(video.title);
-    groups[classified.primaryFormat].push({
+  if (!classifiedItems.length) {
+    return {
+      formats: [],
+      channelMedianViews: channelMedianViews,
+      bestFormatId: null,
+      insight: "Analyzing title formats with Gemini AI for videos in this period…",
+      hasEnoughData: false,
+      classifiedCount: 0,
+      pendingCount: pendingCount,
+    };
+  }
+
+  const groups = {};
+  classifiedItems.forEach(function (video) {
+    const label = getVideoTitleFormatLabel(video);
+    if (!label) return;
+    const id = titleFormatSlug(label);
+    if (!groups[id]) {
+      groups[id] = { id: id, label: label, shortLabel: titleFormatShortLabel(label), videos: [] };
+    }
+    groups[id].videos.push({
       id: video.id,
       title: video.title || "",
       publishedAt: video.publishedAt,
@@ -3044,16 +3213,15 @@ function buildTitleFormatPerformance(items) {
       engagementRate: videoEngagementRate(video),
       charCount: countTitleChars(video.title),
       wordCount: countTitleWords(video.title),
-      characteristics: classified.characteristics,
+      characteristics: video.titleFormatClassification.characteristics || extractTitleCharacteristics(video.title),
     });
   });
 
   const sum = function (arr) { return arr.reduce(function (a, b) { return a + b; }, 0); };
-  const formats = TITLE_FORMAT_DEFS.map(function (def) {
-    const entries = groups[def.id];
+  const formats = Object.keys(groups).map(function (groupId) {
+    const group = groups[groupId];
+    const entries = group.videos;
     const count = entries.length;
-    if (!count) return null;
-
     const views = entries.map(function (e) { return e.viewCount; });
     const likes = entries.map(function (e) { return e.likeCount; });
     const comments = entries.map(function (e) { return e.commentCount; });
@@ -3063,9 +3231,9 @@ function buildTitleFormatPerformance(items) {
     entries.sort(function (a, b) { return b.viewCount - a.viewCount; });
 
     return {
-      id: def.id,
-      label: def.label,
-      shortLabel: def.shortLabel,
+      id: group.id,
+      label: group.label,
+      shortLabel: group.shortLabel,
       count: count,
       medianViews: medianViews,
       avgViews: sum(views) / count,
@@ -3076,7 +3244,7 @@ function buildTitleFormatPerformance(items) {
       limitedSample: count < TITLE_FORMAT_MIN_INSIGHT_VIDEOS,
       videos: entries,
     };
-  }).filter(Boolean);
+  });
 
   formats.sort(function (a, b) {
     if (b.medianViews !== a.medianViews) return b.medianViews - a.medianViews;
@@ -3093,6 +3261,8 @@ function buildTitleFormatPerformance(items) {
     bestFormatId: best ? best.id : null,
     insight: insightResult.text,
     hasEnoughData: insightResult.hasEnoughData,
+    classifiedCount: classifiedItems.length,
+    pendingCount: pendingCount,
   };
 }
 
@@ -4595,16 +4765,16 @@ function TitleFormatPerformanceBlock(props) {
     setExpandedFormatId(null);
   }, [data]);
 
-  if (!data || !data.formats || !data.formats.length) return null;
+  if (!data) return null;
 
-  const best = data.bestFormatId
+  const best = data.bestFormatId && data.formats && data.formats.length
     ? data.formats.find(function (f) { return f.id === data.bestFormatId; })
     : null;
-  const chartFormats = data.formats.filter(function (f) { return f.count > 0; });
+  const chartFormats = (data.formats || []).filter(function (f) { return f.count > 0; });
   const maxMedianViews = Math.max(1, chartFormats.reduce(function (max, f) {
     return Math.max(max, f.medianViews);
   }, 0));
-  const expandedFormat = expandedFormatId
+  const expandedFormat = expandedFormatId && data.formats
     ? data.formats.find(function (f) { return f.id === expandedFormatId; })
     : null;
 
@@ -4612,9 +4782,22 @@ function TitleFormatPerformanceBlock(props) {
     setExpandedFormatId(function (current) { return current === formatId ? null : formatId; });
   }
 
+  if (!data.formats || !data.formats.length) {
+    return (
+      <div className="mt-5">
+        <InsightSectionTitle hint="Gemini AI classifies each title into a meaningful format pattern. Performance Index = format median views ÷ channel median views in this period.">
+          Title Format Performance
+        </InsightSectionTitle>
+        {data.insight && (
+          <p className="mt-2 text-sm leading-relaxed text-slate-500">{data.insight}</p>
+        )}
+      </div>
+    );
+  }
+
   return (
     <div className="mt-5">
-      <InsightSectionTitle hint="Rule-based title format classification (no AI). Each video gets one primary format using regex patterns. Performance Index = format median views ÷ channel median views in this period.">
+      <InsightSectionTitle hint="Gemini AI classifies each title into a meaningful format pattern. Performance Index = format median views ÷ channel median views in this period.">
         Title Format Performance
       </InsightSectionTitle>
 
@@ -4759,6 +4942,7 @@ function TitleLabPanel(props) {
   const titleLab = props.titleLab;
   const range = props.range;
   const [contentFormat, setContentFormat] = useState("all");
+  const classifyGenRef = useRef(0);
   if (!titleLab) return null;
 
   const active = (titleLab.formats && titleLab.formats[contentFormat]) || titleLab.formats.all;
@@ -4769,6 +4953,50 @@ function TitleLabPanel(props) {
     short: "No Shorts published in this period to analyze titles.",
     live: "No live streams published in this period to analyze titles.",
   };
+
+  const unclassifiedTitleFormatCount = useMemo(function () {
+    if (!props.allVideos || !props.allVideos.length) return 0;
+    const bounds = getRangeBounds(range);
+    const periodVideos = filterVideosByContentFormat(
+      filterByBounds(performanceVideos(props.allVideos), bounds.start, bounds.end),
+      contentFormat
+    );
+    return periodVideos.filter(function (v) {
+      return !isValidTitleFormatClassification(v.titleFormatClassification);
+    }).length;
+  }, [props.allVideos, range, contentFormat]);
+
+  useEffect(function () {
+    classifyGenRef.current++;
+  }, [props.channelId]);
+
+  useEffect(function () {
+    if (!props.channelId || !props.allVideos || !props.allVideos.length || !unclassifiedTitleFormatCount) return;
+    if (props.canUseGemini === false) return;
+
+    const gen = ++classifyGenRef.current;
+    const bounds = getRangeBounds(range);
+    const periodVideos = filterVideosByContentFormat(
+      filterByBounds(performanceVideos(props.allVideos), bounds.start, bounds.end),
+      contentFormat
+    );
+    const priorityIds = {};
+    periodVideos.forEach(function (v) { priorityIds[v.id] = true; });
+    if (!Object.keys(priorityIds).length) return;
+
+    classifyTitleFormatsWithGemini(props.channelId, props.allVideos, {
+      canUseGemini: props.canUseGemini !== false,
+      priorityIds: priorityIds,
+      periodOnly: true,
+    }).then(function () {
+      if (gen !== classifyGenRef.current) return;
+      if (props.onClassificationsUpdated) props.onClassificationsUpdated();
+    }).catch(function (e) {
+      if (gen !== classifyGenRef.current) return;
+      if (props.onClassificationsUpdated) props.onClassificationsUpdated();
+      console.warn("Title format classification failed:", e);
+    });
+  }, [props.channelId, props.allVideos, props.onClassificationsUpdated, props.canUseGemini, unclassifiedTitleFormatCount, range, contentFormat]);
 
   const summaryMetrics = [
     {
@@ -4797,7 +5025,7 @@ function TitleLabPanel(props) {
     <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm sm:p-5">
       <PanelSectionHeader
         title={
-          <PanelTitle hint="Title length and format patterns for videos in the selected period — character counts, length buckets, rule-based title formats, and which styles perform best. Filter by long-form, Shorts, or Live so formats are not mixed.">
+          <PanelTitle hint="Title length and format patterns for videos in the selected period — character counts, length buckets, AI title-format analysis, and which styles perform best. Filter by long-form, Shorts, or Live so formats are not mixed.">
             Title Lab
           </PanelTitle>
         }
@@ -4856,7 +5084,18 @@ function TitleLabPanel(props) {
           </div>
 
           <TitleLengthPerformanceBlock data={active.titleLengthPerformance} />
-          <TitleFormatPerformanceBlock data={active.titleFormatPerformance} showContentFormat={contentFormat === "all"} />
+          <TitleFormatPerformanceBlock
+            data={
+              props.canUseGemini === false && active.titleFormatPerformance && active.titleFormatPerformance.pendingCount > 0
+                ? Object.assign({}, active.titleFormatPerformance, {
+                  formats: [],
+                  insight: "AI title format analysis is turned off for users right now. Saved classifications will still appear when available.",
+                  hasEnoughData: false,
+                })
+                : active.titleFormatPerformance
+            }
+            showContentFormat={contentFormat === "all"}
+          />
         </>
       )}
     </div>
@@ -5582,6 +5821,7 @@ function App() {
       if (response.usage) setChannelUsage(response.usage);
       let entry = response.entry;
       entry = await mergeTopicClassificationsFromCache(entry);
+      entry = await mergeTitleFormatClassificationsFromCache(entry);
       if (gen !== analysisGenRef.current) return;
       await saveChannelCache(entry);
       if (gen !== analysisGenRef.current) return;
@@ -5608,6 +5848,7 @@ function App() {
       videoIds: cacheEntry.videoIds,
       rawVideos: cacheEntry.rawVideos.map(compactRawVideo).filter(Boolean),
       topicClassifications: cacheEntry.topicClassifications || {},
+      titleFormatClassifications: cacheEntry.titleFormatClassifications || {},
     };
     memoryChannelCache.set(cacheEntry.channelId, interim);
     applyCacheEntry(interim);
@@ -5625,8 +5866,10 @@ function App() {
 
   const showCachedChannel = useCallback(function (cached, gen) {
     applyCacheEntry(cached);
-    if (API_BASE && getStoredAuthToken() && cached && cached.channelId) {
+    if (cached && cached.channelId) {
       hydrateTopicClassificationsForEntry(cached).then(function (entry) {
+        return hydrateTitleFormatClassificationsForEntry(entry);
+      }).then(function (entry) {
         if (gen !== analysisGenRef.current) return;
         saveChannelCache(entry).then(function () {
           if (gen !== analysisGenRef.current) return;
@@ -5690,6 +5933,7 @@ function App() {
         if (response.usage) setChannelUsage(response.usage);
         let entry = response.entry;
         entry = await mergeTopicClassificationsFromCache(entry);
+        entry = await mergeTitleFormatClassificationsFromCache(entry);
         setActivityRange(DEFAULT_ACTIVITY_RANGE);
         setContentPerformanceRange(DEFAULT_ACTIVITY_RANGE);
         setContentTopicsRange(DEFAULT_ACTIVITY_RANGE);
@@ -5801,11 +6045,13 @@ function App() {
           videoIds: result.classified.map(function (v) { return v.id; }),
           rawVideos: result.classified.map(function (v) { return v.raw || v; }),
           topicClassifications: {},
+          titleFormatClassifications: {},
           lastSyncedAt: result.lastAnalyzedAt,
           lastAnalyzedAt: result.lastAnalyzedAt,
         };
       }
       entry = await hydrateTopicClassificationsForEntry(entry);
+      entry = await hydrateTitleFormatClassificationsForEntry(entry);
       memoryChannelCache.set(result.channel.id, entry);
       await saveChannelCache(entry);
       setResult(buildResultFromCache(entry));
@@ -5814,9 +6060,38 @@ function App() {
     }
   }, [result]);
 
+  const refreshTitleFormatClassifications = useCallback(async function () {
+    if (!result || !result.channel) return;
+    try {
+      let entry = loadChannelCacheSync(result.channel.id) || await loadChannelCache(result.channel.id);
+      if (!entry) {
+        entry = {
+          version: CACHE_VERSION,
+          channelId: result.channel.id,
+          channel: result.channel,
+          videoIds: result.classified.map(function (v) { return v.id; }),
+          rawVideos: result.classified.map(function (v) { return v.raw || v; }),
+          topicClassifications: {},
+          titleFormatClassifications: {},
+          lastSyncedAt: result.lastAnalyzedAt,
+          lastAnalyzedAt: result.lastAnalyzedAt,
+        };
+      }
+      entry = await hydrateTitleFormatClassificationsForEntry(entry);
+      memoryChannelCache.set(result.channel.id, entry);
+      await saveChannelCache(entry);
+      setResult(buildResultFromCache(entry));
+    } catch (e) {
+      console.warn("Could not refresh title format classifications:", e);
+    }
+  }, [result]);
+
   useEffect(function () {
-    if (!result || !result.channel || !API_BASE || !getStoredAuthToken()) return;
-    refreshTopicClassifications();
+    if (!result || !result.channel) return;
+    if (API_BASE && getStoredAuthToken()) {
+      refreshTopicClassifications();
+      refreshTitleFormatClassifications();
+    }
   }, [result && result.channel ? result.channel.id : null]);
 
   const isInitialLoading = phase === "loading" && !result;
@@ -6067,6 +6342,10 @@ function App() {
                 titleLab={titleLab}
                 range={titleLabRange}
                 onRangeChange={setTitleLabRange}
+                channelId={result.channel.id}
+                allVideos={result.classified}
+                onClassificationsUpdated={refreshTitleFormatClassifications}
+                canUseGemini={!API_BASE || geminiTopicAnalysis}
               />
 
           </div>

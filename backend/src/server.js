@@ -23,6 +23,7 @@ import {
 } from "./adminService.js";
 import { getAppSettings, setMaxChannelsPerUser, setGeminiEnabledForUsers, assertGeminiAllowedForUser, canUserUseGemini, getGeminiEnabledForUsers } from "./settingsService.js";
 import { getTopicClassifications, mergeTopicClassifications } from "./topicService.js";
+import { getTitleFormatClassifications, mergeTitleFormatClassifications } from "./titleFormatService.js";
 import { logGeminiUsage } from "./usageService.js";
 
 const app = express();
@@ -244,6 +245,39 @@ app.put("/channels/:channelId/topic-classifications", requireAuth, async (req, r
       metadata: { count: Object.keys(classifications).length },
     });
     res.json({ channelId, topicClassifications });
+  } catch (err) {
+    const status = err.status || 500;
+    res.status(status).json({ error: err.message, code: err.code || undefined });
+  }
+});
+
+app.get("/channels/:channelId/title-format-classifications", requireAuth, async (req, res) => {
+  try {
+    const channelId = req.params.channelId;
+    await assertUserCanAnalyzeChannel(req.user, channelId);
+    const titleFormatClassifications = await getTitleFormatClassifications(channelId);
+    res.json({ channelId, titleFormatClassifications });
+  } catch (err) {
+    const status = err.status || 500;
+    res.status(status).json({ error: err.message, code: err.code || undefined });
+  }
+});
+
+app.put("/channels/:channelId/title-format-classifications", requireAuth, async (req, res) => {
+  const classifications = req.body?.classifications;
+  if (!classifications || typeof classifications !== "object" || Array.isArray(classifications)) {
+    return res.status(400).json({ error: "classifications object is required." });
+  }
+  try {
+    const channelId = req.params.channelId;
+    await assertUserCanAnalyzeChannel(req.user, channelId);
+    await assertGeminiAllowedForUser(req.user);
+    const titleFormatClassifications = await mergeTitleFormatClassifications(channelId, classifications);
+    await logUserActivity(req.user.id, "save_title_format_classifications", {
+      channelId,
+      metadata: { count: Object.keys(classifications).length },
+    });
+    res.json({ channelId, titleFormatClassifications });
   } catch (err) {
     const status = err.status || 500;
     res.status(status).json({ error: err.message, code: err.code || undefined });

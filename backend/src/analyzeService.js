@@ -3,6 +3,7 @@ import { parseChannelAttempts, lookupHandleKey, isCacheFresh } from "./handle.js
 import { fetchChannelFromYouTube, QuotaTracker } from "./youtube.js";
 import { logUserActivity } from "./userService.js";
 import { sanitizeClassificationsMap } from "./topicService.js";
+import { sanitizeTitleFormatClassificationsMap } from "./titleFormatService.js";
 import { logApiUsageBatch } from "./usageService.js";
 
 const CHANNEL_SELECT = `
@@ -13,6 +14,7 @@ const CHANNEL_SELECT = `
   video_ids,
   cached_videos,
   topic_classifications,
+  title_format_classifications,
   last_synced_at
 `;
 
@@ -175,6 +177,7 @@ export async function logQuotaUsage(client, { calls, channelId, requestSource, u
 
 export function toAnalyzeResponse(row, rawVideos, source, unitsUsed) {
   const topicClassifications = sanitizeClassificationsMap(row.topic_classifications);
+  const titleFormatClassifications = sanitizeTitleFormatClassificationsMap(row.title_format_classifications);
   return {
     source,
     units_used: unitsUsed,
@@ -184,6 +187,7 @@ export function toAnalyzeResponse(row, rawVideos, source, unitsUsed) {
     videoIds: row.video_ids,
     rawVideos,
     topicClassifications,
+    titleFormatClassifications,
   };
 }
 

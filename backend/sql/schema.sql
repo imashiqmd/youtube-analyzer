@@ -118,3 +118,5 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT FAL
 ALTER TABLE channels ADD COLUMN IF NOT EXISTS cached_videos JSONB NOT NULL DEFAULT '[]'::jsonb;
 
 ALTER TABLE channels ADD COLUMN IF NOT EXISTS topic_classifications JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+ALTER TABLE channels ADD COLUMN IF NOT EXISTS title_format_classifications JSONB NOT NULL DEFAULT '{}'::jsonb;
