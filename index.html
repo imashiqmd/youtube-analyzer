@@ -147,25 +147,34 @@ async function saveTopicClassificationsToApi(channelId, classifications) {
 }
 
 async function applyTopicClassificationsToVideos(channelId, videos, topicMap) {
-  if (!videos || !videos.length || !topicMap) return;
+  if (!videos || !videos.length || !topicMap) return 0;
+  let applied = 0;
+  const mem = memoryChannelCache.get(channelId);
+  if (mem && !mem.topicClassifications) mem.topicClassifications = {};
+
   for (let i = 0; i < videos.length; i++) {
     const video = videos[i];
     const videoId = video.id || video.videoId;
     if (!videoId) continue;
     const classification = topicMap[videoId];
     if (!isValidTopicClassification(classification)) continue;
+    if (isValidTopicClassification(video.topicClassification)) continue;
     video.topicClassification = classification;
+    if (mem) mem.topicClassifications[videoId] = classification;
     await saveVideoTopicClassification(channelId, videoId, classification, { skipApi: true });
+    applied++;
   }
+  return applied;
 }
 
-async function mergeTopicClassificationsFromCache(entry) {
+async function hydrateTopicClassificationsForEntry(entry) {
+  if (!entry || !entry.channelId) return entry;
+
   let serverMap = entry.topicClassifications || {};
-  if (API_BASE && getStoredAuthToken() && entry.channelId) {
+  if (API_BASE && getStoredAuthToken()) {
     try {
       const apiMap = await fetchTopicClassificationsFromApi(entry.channelId);
       serverMap = Object.assign({}, serverMap, apiMap);
-      entry.topicClassifications = serverMap;
     } catch (e) {
       console.warn("Could not load topic classifications from server:", e);
     }
@@ -175,8 +184,32 @@ async function mergeTopicClassificationsFromCache(entry) {
     const local = await loadChannelCache(entry.channelId);
     const localMap = (local && local.topicClassifications) ? local.topicClassifications : {};
     entry.topicClassifications = Object.assign({}, localMap, serverMap);
+  } catch (e) {
+    entry.topicClassifications = serverMap;
+  }
 
-    if (API_BASE && getStoredAuthToken() && entry.channelId) {
+  if (entry.rawVideos && entry.rawVideos.length && entry.topicClassifications) {
+    entry.rawVideos.forEach(function (raw) {
+      if (!raw || !raw.id) return;
+      const classification = entry.topicClassifications[raw.id];
+      if (isValidTopicClassification(classification)) {
+        raw.topicClassification = classification;
+      }
+    });
+  }
+
+  memoryChannelCache.set(entry.channelId, entry);
+  return entry;
+}
+
+async function mergeTopicClassificationsFromCache(entry) {
+  entry = await hydrateTopicClassificationsForEntry(entry);
+
+  if (API_BASE && getStoredAuthToken() && entry.channelId) {
+    try {
+      const local = await loadChannelCache(entry.channelId);
+      const localMap = (local && local.topicClassifications) ? local.topicClassifications : {};
+      const serverMap = entry.topicClassifications || {};
       const toUpload = {};
       Object.keys(localMap).forEach(function (videoId) {
         const localClass = localMap[videoId];
@@ -186,10 +219,13 @@ async function mergeTopicClassificationsFromCache(entry) {
       });
       if (Object.keys(toUpload).length) {
         const merged = await saveTopicClassificationsToApi(entry.channelId, toUpload);
-        if (merged) entry.topicClassifications = Object.assign({}, entry.topicClassifications, merged);
+        if (merged) {
+          entry.topicClassifications = Object.assign({}, entry.topicClassifications || {}, merged);
+          await hydrateTopicClassificationsForEntry(entry);
+        }
       }
-    }
-  } catch (e) { /* keep server data */ }
+    } catch (e) { /* keep merged entry */ }
+  }
 
   return entry;
 }
@@ -503,7 +539,7 @@ function isValidCacheEntry(entry) {
 function assembleCacheEntry(channelMeta, videoRecords) {
   if (!channelMeta || channelMeta.version !== CACHE_VERSION) return null;
   const videoMap = {};
-  const topicClassifications = {};
+  const topicClassifications = Object.assign({}, channelMeta.topicClassifications || {});
   (videoRecords || []).forEach(function (record) {
     if (record && record.videoId && record.raw) videoMap[record.videoId] = record.raw;
     if (record && record.videoId && record.topicClassification) {
@@ -533,6 +569,7 @@ function toChannelMeta(entry) {
     channel: entry.channel,
     videoIds: entry.videoIds || entry.rawVideos.map(function (v) { return v.id; }),
     lastSyncedAt: lastSyncedAt,
+    topicClassifications: entry.topicClassifications || {},
   };
 }
 
@@ -617,6 +654,11 @@ async function saveVideoTopicClassification(channelId, videoId, classification, 
   const store = tx.objectStore(VIDEO_STORE);
   const existing = await idbRequest(store.get(key));
   if (!existing) {
+    const mem = memoryChannelCache.get(channelId);
+    if (mem) {
+      if (!mem.topicClassifications) mem.topicClassifications = {};
+      mem.topicClassifications[videoId] = classification;
+    }
     await waitTransaction(tx);
     return false;
   }
@@ -2238,10 +2280,11 @@ async function classifyVideosWithGemini(channelId, videos, options) {
   const onProgress = opts.onProgress;
   const periodOnly = opts.periodOnly !== false;
 
+  let loadedFromCache = 0;
   if (API_BASE && getStoredAuthToken() && channelId) {
     try {
       const serverMap = await fetchTopicClassificationsFromApi(channelId);
-      await applyTopicClassificationsToVideos(channelId, videos, serverMap);
+      loadedFromCache = await applyTopicClassificationsToVideos(channelId, videos, serverMap);
     } catch (e) {
       console.warn("Could not load cached topic classifications:", e);
     }
@@ -2259,7 +2302,15 @@ async function classifyVideosWithGemini(channelId, videos, options) {
     return (priorityIds[b.id] ? 1 : 0) - (priorityIds[a.id] ? 1 : 0);
   });
 
-  if (!unclassified.length) return { classified: 0, total: 0, stoppedEarly: false };
+  if (!unclassified.length) {
+    if (onProgress) onProgress(0, 0);
+    return {
+      classified: 0,
+      total: 0,
+      loadedFromCache: loadedFromCache,
+      stoppedEarly: false,
+    };
+  }
 
   const existingTopics = {};
   videos.forEach(function (v) {
@@ -2274,7 +2325,10 @@ async function classifyVideosWithGemini(channelId, videos, options) {
 
   for (let i = 0; i < unclassified.length; i += GEMINI_BATCH_SIZE) {
     const batch = unclassified.slice(i, i + GEMINI_BATCH_SIZE);
-    if (onProgress) onProgress(classified, unclassified.length);
+    if (onProgress) {
+      if (i === 0) onProgress(0, unclassified.length);
+      else onProgress(classified, unclassified.length);
+    }
 
     let results;
     try {
@@ -2328,6 +2382,7 @@ async function classifyVideosWithGemini(channelId, videos, options) {
   return {
     classified: classified,
     total: unclassified.length,
+    loadedFromCache: loadedFromCache,
     stoppedEarly: stoppedEarly,
     stopReason: stopReason,
   };
@@ -3585,7 +3640,7 @@ function ContentTopicsPanel(props) {
 
     setClassifying(true);
     setClassifyError(null);
-    setClassifyMsg("Classifying topics with AI…");
+    setClassifyMsg("Checking saved topic classifications…");
 
     classifyVideosWithGemini(props.channelId, props.allVideos, {
       canUseGemini: props.canUseGemini !== false,
@@ -3593,11 +3648,16 @@ function ContentTopicsPanel(props) {
       periodOnly: true,
       onProgress: function (done, total) {
         if (gen !== classifyGenRef.current) return;
-        setClassifyMsg("Classifying topics with AI… " + done + "/" + total);
+        if (total > 0) setClassifyMsg("Classifying topics with Gemini AI… " + done + "/" + total);
       },
     }).then(function (result) {
       if (gen !== classifyGenRef.current) return;
       if (props.onClassificationsUpdated) props.onClassificationsUpdated();
+      if (result && result.classified === 0 && result.loadedFromCache > 0) {
+        setClassifyMsg("Loaded " + result.loadedFromCache + " topic" + (result.loadedFromCache === 1 ? "" : "s") + " from database — no Gemini API used.");
+      } else if (result && result.classified === 0 && result.total === 0) {
+        setClassifyMsg("All topics for this period are already saved in the database.");
+      }
       if (result && result.stoppedEarly && result.stopReason) {
         setClassifyError(result.stopReason);
       }
@@ -4580,6 +4640,18 @@ function App() {
 
   const showCachedChannel = useCallback(function (cached, gen) {
     applyCacheEntry(cached);
+    if (API_BASE && getStoredAuthToken() && cached && cached.channelId) {
+      hydrateTopicClassificationsForEntry(cached).then(function (entry) {
+        if (gen !== analysisGenRef.current) return;
+        saveChannelCache(entry).then(function () {
+          if (gen !== analysisGenRef.current) return;
+          applyCacheEntry(entry);
+        }).catch(function () {
+          if (gen !== analysisGenRef.current) return;
+          applyCacheEntry(entry);
+        });
+      }).catch(function () { /* keep cached view */ });
+    }
     if (isCacheFresh(cached)) {
       setRefreshing(false);
       setStatusMsg("");
@@ -4735,15 +4807,32 @@ function App() {
   const refreshTopicClassifications = useCallback(async function () {
     if (!result || !result.channel) return;
     try {
-      const entry = await loadChannelCache(result.channel.id);
-      if (entry) {
-        memoryChannelCache.set(result.channel.id, entry);
-        setResult(buildResultFromCache(entry));
+      let entry = loadChannelCacheSync(result.channel.id) || await loadChannelCache(result.channel.id);
+      if (!entry) {
+        entry = {
+          version: CACHE_VERSION,
+          channelId: result.channel.id,
+          channel: result.channel,
+          videoIds: result.classified.map(function (v) { return v.id; }),
+          rawVideos: result.classified.map(function (v) { return v.raw || v; }),
+          topicClassifications: {},
+          lastSyncedAt: result.lastAnalyzedAt,
+          lastAnalyzedAt: result.lastAnalyzedAt,
+        };
       }
+      entry = await hydrateTopicClassificationsForEntry(entry);
+      memoryChannelCache.set(result.channel.id, entry);
+      await saveChannelCache(entry);
+      setResult(buildResultFromCache(entry));
     } catch (e) {
       console.warn("Could not refresh topic classifications:", e);
     }
   }, [result]);
+
+  useEffect(function () {
+    if (!result || !result.channel || !API_BASE || !getStoredAuthToken()) return;
+    refreshTopicClassifications();
+  }, [result && result.channel ? result.channel.id : null]);
 
   const isInitialLoading = phase === "loading" && !result;
 

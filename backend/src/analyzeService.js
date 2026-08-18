@@ -2,6 +2,7 @@ import { pool, withTransaction } from "./db.js";
 import { parseChannelAttempts, lookupHandleKey, isCacheFresh } from "./handle.js";
 import { fetchChannelFromYouTube, QuotaTracker } from "./youtube.js";
 import { logUserActivity } from "./userService.js";
+import { sanitizeClassificationsMap } from "./topicService.js";
 
 const CHANNEL_SELECT = `
   channel_id,
@@ -194,18 +195,7 @@ export async function logQuotaUsage(client, { calls, channelId, requestSource, u
 }
 
 export function toAnalyzeResponse(row, rawVideos, source, unitsUsed) {
-  let topicClassifications = {};
-  if (row.topic_classifications) {
-    if (typeof row.topic_classifications === "string") {
-      try {
-        topicClassifications = JSON.parse(row.topic_classifications);
-      } catch {
-        topicClassifications = {};
-      }
-    } else if (typeof row.topic_classifications === "object") {
-      topicClassifications = row.topic_classifications;
-    }
-  }
+  const topicClassifications = sanitizeClassificationsMap(row.topic_classifications);
   return {
     source,
     units_used: unitsUsed,
