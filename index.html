@@ -795,10 +795,9 @@ function isCacheFresh(entry) {
 
 function buildResultFromCache(entry) {
   const topicClassifications = entry.topicClassifications || {};
-  let classified = entry.rawVideos.map(function (v) {
+  const classified = entry.rawVideos.map(function (v) {
     return classifyVideo(v, topicClassifications[v.id] || null);
   });
-  classified = attachChannelPerformanceMetrics(classified, entry.channel);
   return {
     channel: entry.channel,
     totalFetched: entry.rawVideos.length,
@@ -1775,147 +1774,6 @@ function medianValue(values) {
   return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
 }
 
-// ---------- local performance metrics (LOS, log z-score, VPS) ----------
-
-const LOS_K_WEEKLY = 10;
-const LOS_K_DAILY = 20;
-const LOS_K_MONTHLY = 5;
-const LOS_OUTPERFORMER = 2.0;
-const LOS_NORMAL_LOW = 0.8;
-const LOS_NORMAL_HIGH = 1.2;
-const LOS_FLOP = 0.5;
-
-function pickLosWindowK(videos) {
-  if (!videos || videos.length < 2) return LOS_K_MONTHLY;
-  const sorted = videos.slice().sort(function (a, b) {
-    return new Date(a.publishedAt) - new Date(b.publishedAt);
-  });
-  const gaps = [];
-  for (let i = 1; i < sorted.length; i++) {
-    gaps.push((new Date(sorted[i].publishedAt) - new Date(sorted[i - 1].publishedAt)) / 86400000);
-  }
-  const medianGap = medianValue(gaps);
-  if (medianGap <= 2) return LOS_K_DAILY;
-  if (medianGap <= 10) return LOS_K_WEEKLY;
-  return LOS_K_MONTHLY;
-}
-
-function computeLocalWindowMetricsForSequence(videos, k) {
-  const sorted = videos.slice().sort(function (a, b) {
-    return new Date(a.publishedAt) - new Date(b.publishedAt);
-  });
-  const metricsById = {};
-
-  for (let i = 0; i < sorted.length; i++) {
-    const video = sorted[i];
-    const start = Math.max(0, i - k);
-    const end = Math.min(sorted.length - 1, i + k);
-    const neighbors = [];
-    for (let j = start; j <= end; j++) {
-      if (j !== i) neighbors.push(sorted[j]);
-    }
-
-    const neighborViews = neighbors.map(function (v) { return v.viewCount || 0; });
-    const neighborLogViews = neighbors.map(function (v) { return Math.log((v.viewCount || 0) + 1); });
-    const losMedian = medianValue(neighborViews);
-    let los = null;
-    if (neighbors.length > 0 && losMedian > 0) {
-      los = video.viewCount / losMedian;
-    }
-
-    let logZ = null;
-    if (neighbors.length >= 2) {
-      const meanLog = neighborLogViews.reduce(function (sum, val) { return sum + val; }, 0) / neighborLogViews.length;
-      const variance = neighborLogViews.reduce(function (sum, val) {
-        const diff = val - meanLog;
-        return sum + diff * diff;
-      }, 0) / (neighborLogViews.length - 1);
-      const stdev = Math.sqrt(variance);
-      const selfLog = Math.log((video.viewCount || 0) + 1);
-      logZ = stdev > 1e-9 ? (selfLog - meanLog) / stdev : 0;
-    }
-
-    metricsById[video.id] = {
-      los: los,
-      logZ: logZ,
-      losMedian: losMedian,
-      neighborCount: neighbors.length,
-    };
-  }
-
-  return metricsById;
-}
-
-function computeViewsPerSubscriber(viewCount, subscriberCount) {
-  if (!subscriberCount || subscriberCount <= 0) return null;
-  return viewCount / subscriberCount;
-}
-
-function losPerformanceLabel(los) {
-  if (los === null || los === undefined || isNaN(los)) return null;
-  if (los > LOS_OUTPERFORMER) return "outperformer";
-  if (los < LOS_FLOP) return "flop";
-  if (los >= LOS_NORMAL_LOW && los <= LOS_NORMAL_HIGH) return "normal";
-  return "mixed";
-}
-
-function attachChannelPerformanceMetrics(classified, channel) {
-  const performance = performanceVideos(classified);
-  const metricsMaps = { long: {}, short: {}, live: {} };
-  const kByCategory = {};
-
-  ["long", "short", "live"].forEach(function (category) {
-    const subset = performance.filter(function (v) { return v.category === category; });
-    const k = pickLosWindowK(subset);
-    kByCategory[category] = k;
-    metricsMaps[category] = computeLocalWindowMetricsForSequence(subset, k);
-  });
-
-  const subscriberCount = channel && channel.subscriberCount;
-
-  return classified.map(function (video) {
-    if (video.category !== "long" && video.category !== "short" && video.category !== "live") {
-      return video;
-    }
-    const metrics = metricsMaps[video.category][video.id] || {};
-    const los = metrics.los;
-    return Object.assign({}, video, {
-      los: los,
-      logZ: metrics.logZ,
-      losMedian: metrics.losMedian,
-      losNeighborCount: metrics.neighborCount,
-      losWindowK: kByCategory[video.category],
-      vps: computeViewsPerSubscriber(video.viewCount, subscriberCount),
-      performanceLabel: losPerformanceLabel(los),
-      isBreakout: isBreakoutVideo(los),
-      breakoutRatio: los,
-    });
-  });
-}
-
-function formatLosScore(los) {
-  if (los === null || los === undefined || isNaN(los)) return "—";
-  return formatBreakoutMultiplier(los);
-}
-
-function formatLogZScore(z) {
-  if (z === null || z === undefined || isNaN(z)) return "—";
-  const rounded = Math.abs(z) >= 10 ? Math.round(z) : parseFloat(z.toFixed(2));
-  return (rounded > 0 ? "+" : "") + rounded;
-}
-
-function formatVpsRatio(vps) {
-  if (vps === null || vps === undefined || isNaN(vps)) return "—";
-  if (vps >= 1) return parseFloat(vps.toFixed(2)) + "× subs";
-  return formatPercent(vps * 100, 2) + " of subs";
-}
-
-function averageMetric(values) {
-  const usable = (values || []).filter(function (v) { return v !== null && v !== undefined && !isNaN(v); });
-  if (!usable.length) return 0;
-  return usable.reduce(function (sum, v) { return sum + v; }, 0) / usable.length;
-}
-
 function percentileValue(values, p) {
   if (!values.length) return 0;
   const sorted = values.slice().sort(function (a, b) { return a - b; });
@@ -2009,14 +1867,10 @@ function computeMonthlyAvgViewsTrend(items, range) {
   });
 }
 
-const BREAKOUT_RATIO_THRESHOLD = LOS_OUTPERFORMER;
+const BREAKOUT_RATIO_THRESHOLD = 2;
 
-function isBreakoutVideo(losOrViewCount, typicalMedian) {
-  if (typicalMedian === undefined) {
-    return losOrViewCount !== null && losOrViewCount !== undefined && !isNaN(losOrViewCount) &&
-      losOrViewCount >= LOS_OUTPERFORMER;
-  }
-  return typicalMedian > 0 && losOrViewCount >= typicalMedian * BREAKOUT_RATIO_THRESHOLD;
+function isBreakoutVideo(viewCount, typicalMedian) {
+  return typicalMedian > 0 && viewCount >= typicalMedian * BREAKOUT_RATIO_THRESHOLD;
 }
 
 function formatBreakoutMultiplier(n) {
@@ -2027,13 +1881,7 @@ function formatBreakoutMultiplier(n) {
 
 function sortVideosByMetric(videos, metric) {
   const copy = videos.slice();
-  if (metric === "los") {
-    copy.sort(function (a, b) { return (b.los || 0) - (a.los || 0); });
-  } else if (metric === "logZ") {
-    copy.sort(function (a, b) { return (b.logZ || -Infinity) - (a.logZ || -Infinity); });
-  } else if (metric === "vps") {
-    copy.sort(function (a, b) { return (b.vps || 0) - (a.vps || 0); });
-  } else if (metric === "viewsPerDay") {
+  if (metric === "viewsPerDay") {
     copy.sort(function (a, b) { return b.viewsPerDay - a.viewsPerDay; });
   } else if (metric === "engagement") {
     copy.sort(function (a, b) { return b.engagementRate - a.engagementRate; });
@@ -2043,12 +1891,14 @@ function sortVideosByMetric(videos, metric) {
   return copy;
 }
 
-function enrichVideosWithBreakout(enriched) {
+function enrichVideosWithBreakout(enriched, typicalMedian, formatBaselines) {
   return enriched.map(function (video) {
+    const baseline = typicalMedianForVideo(video, typicalMedian, formatBaselines);
+    const breakout = isBreakoutVideo(video.viewCount, baseline);
     return Object.assign({}, video, {
-      isBreakout: !!video.isBreakout,
-      breakoutRatio: video.los,
-      typicalViews: video.losMedian,
+      isBreakout: breakout,
+      breakoutRatio: baseline > 0 ? video.viewCount / baseline : 0,
+      typicalViews: baseline,
     });
   });
 }
@@ -2091,11 +1941,7 @@ function buildContentPerformanceInsight(data) {
     if (breakoutCount > 0) {
       if (strongest.isBreakout && strongest.breakoutRatio > 0) {
         tailParts.push(
-          "led by \"" + strongest.title + "\" at " + formatLosScore(strongest.breakoutRatio) + " local typical performance"
-        );
-      } else if (strongest.los !== null && strongest.los !== undefined) {
-        tailParts.push(
-          "led by \"" + strongest.title + "\" with LOS " + formatLosScore(strongest.los)
+          "led by \"" + strongest.title + "\" at " + formatBreakoutMultiplier(strongest.breakoutRatio) + " typical performance"
         );
       } else {
         tailParts.push(
@@ -2120,10 +1966,17 @@ function buildContentPerformanceInsight(data) {
   return lead + ".";
 }
 
-// ---------- content performance ----------
+function typicalMedianForVideo(video, typicalMedian, formatBaselines) {
+  if (formatBaselines && video.category) {
+    const baseline = formatBaselines[video.category];
+    if (baseline > 0) return baseline;
+  }
+  return typicalMedian;
+}
 
 function computeFormatPerformanceSlice(currentItems, previousItems, range, asOf, options) {
   options = options || {};
+  const formatBaselines = options.formatBaselines || null;
   const formatLabel = options.formatLabel || "";
   const current = computePeriodPerformanceStats(currentItems, asOf);
   const previous = computePeriodPerformanceStats(previousItems, asOf);
@@ -2136,9 +1989,6 @@ function computeFormatPerformanceSlice(currentItems, previousItems, range, asOf,
       medianViews: null,
       avgViewsPerDay: null,
       avgEngagement: null,
-      avgLos: null,
-      avgLogZ: null,
-      avgVps: null,
       topVideos: [],
       videos: [],
       breakoutCount: 0,
@@ -2162,17 +2012,14 @@ function computeFormatPerformanceSlice(currentItems, previousItems, range, asOf,
   const typicalLow = percentileValue(periodViews, 0.25);
   const typicalHigh = percentileValue(periodViews, 0.75);
 
-  const videos = enrichVideosWithBreakout(current.enriched);
+  const videos = enrichVideosWithBreakout(current.enriched, typicalMedian, formatBaselines);
   const breakoutVideos = videos.filter(function (it) { return it.isBreakout; });
   const breakoutCount = breakoutVideos.length;
   const avgBreakoutMultiplier = breakoutCount
-    ? breakoutVideos.reduce(function (sum, it) { return sum + (it.breakoutRatio || 0); }, 0) / breakoutCount
+    ? breakoutVideos.reduce(function (sum, it) { return sum + it.breakoutRatio; }, 0) / breakoutCount
     : 0;
   const breakoutTotalViews = breakoutVideos.reduce(function (sum, it) { return sum + it.viewCount; }, 0);
-  const strongestVideo = sortVideosByMetric(videos, "los")[0] || null;
-  const avgLos = averageMetric(videos.map(function (it) { return it.los; }));
-  const avgLogZ = averageMetric(videos.map(function (it) { return it.logZ; }));
-  const avgVps = averageMetric(videos.map(function (it) { return it.vps; }));
+  const strongestVideo = sortVideosByMetric(videos, "views")[0] || null;
 
   let avgViewsPctChange = null;
   if (current && previous && previous.avgViews > 0) {
@@ -2201,11 +2048,8 @@ function computeFormatPerformanceSlice(currentItems, previousItems, range, asOf,
     medianViews: current.medianViews,
     avgViewsPerDay: current.avgViewsPerDay,
     avgEngagement: current.avgEngagement,
-    avgLos: avgLos,
-    avgLogZ: avgLogZ,
-    avgVps: avgVps,
     videos: videos,
-    topVideos: sortVideosByMetric(videos, "los").slice(0, 5),
+    topVideos: sortVideosByMetric(videos, "views").slice(0, 5),
     breakoutCount: breakoutCount,
     avgBreakoutMultiplier: avgBreakoutMultiplier,
     breakoutTotalViews: breakoutTotalViews,
@@ -2264,8 +2108,15 @@ function computeContentPerformance(classified, range) {
     formatLabel: "Live",
   });
 
+  const formatBaselines = {
+    long: longPerf.typicalRange.median,
+    short: shortPerf.typicalRange.median,
+    live: livePerf.typicalRange.median,
+  };
+
   const allPerf = computeFormatPerformanceSlice(currentAll, previousAll, range, asOf, {
     formatLabel: "",
+    formatBaselines: formatBaselines,
   });
 
   const hasAnyData = currentAll.length > 0;
@@ -2630,16 +2481,14 @@ function groupVideosByAiTopic(videos, totalVideos) {
     .slice(0, TOPIC_MAX_MAIN + 1);
 }
 
-function buildTopicMetrics(topic, totalVideos, channelAvgLos) {
+function buildTopicMetrics(topic, totalVideos, channelAvgViews, channelMedianViews) {
   const views = topic.videos.map(function (v) { return v.viewCount; });
   const sum = views.reduce(function (a, b) { return a + b; }, 0);
   const avgViews = views.length ? sum / views.length : 0;
   const medianViews = medianValue(views);
-  const losValues = topic.videos.map(function (v) { return v.los; });
-  const avgLos = averageMetric(losValues);
-  const vsChannelAvg = channelAvgLos > 0 ? avgLos / channelAvgLos : 0;
+  const vsChannelAvg = channelAvgViews > 0 ? avgViews / channelAvgViews : 0;
   const breakoutVideos = topic.videos.filter(function (v) {
-    return !!v.isBreakout;
+    return isBreakoutVideo(v.viewCount, channelMedianViews);
   });
 
   let performanceTier = "average";
@@ -2654,7 +2503,6 @@ function buildTopicMetrics(topic, totalVideos, channelAvgLos) {
     contentSharePct: totalVideos > 0 ? Math.round((topic.videos.length / totalVideos) * 100) : 0,
     avgViews: avgViews,
     medianViews: medianViews,
-    avgLos: avgLos,
     vsChannelAvg: vsChannelAvg,
     performanceTier: performanceTier,
     breakoutCount: breakoutVideos.length,
@@ -2683,7 +2531,7 @@ function identifyEmergingTopics(topics, range) {
   }).sort(function (a, b) { return b.growthRatio - a.growthRatio; }).slice(0, 4);
 }
 
-function buildTopicInsights(topics, emergingTopics, breakoutTopics, channelAvgLos) {
+function buildTopicInsights(topics, emergingTopics, breakoutTopics, channelAvgViews) {
   const insights = [];
   const ranked = topics.slice().sort(function (a, b) { return b.vsChannelAvg - a.vsChannelAvg; });
   const strongest = ranked.find(function (t) { return t.videoCount >= 2 && t.vsChannelAvg >= TOPIC_HIGH_RATIO; });
@@ -2692,9 +2540,8 @@ function buildTopicInsights(topics, emergingTopics, breakoutTopics, channelAvgLo
 
   if (strongest) {
     insights.push(
-      strongest.name + " is the strongest topic, with average LOS " +
-      formatLosScore(strongest.avgLos) + " (" +
-      formatBreakoutMultiplier(strongest.vsChannelAvg) + " the channel average)."
+      strongest.name + " is the strongest topic, generating " +
+      formatBreakoutMultiplier(strongest.vsChannelAvg) + " the channel's average views."
     );
   }
 
@@ -2764,7 +2611,6 @@ function computeContentTopics(classified, range) {
   const channelViews = currentItems.map(function (v) { return v.viewCount; });
   const channelAvgViews = channelViews.reduce(function (a, b) { return a + b; }, 0) / channelViews.length;
   const channelMedianViews = medianValue(channelViews);
-  const channelAvgLos = averageMetric(currentItems.map(function (v) { return v.los; }));
 
   if (!classifiedItems.length) {
     return {
@@ -2783,7 +2629,7 @@ function computeContentTopics(classified, range) {
 
   const topicGroups = groupVideosByAiTopic(classifiedItems, currentItems.length);
   const topics = topicGroups.map(function (group) {
-    return buildTopicMetrics(group, currentItems.length, channelAvgLos);
+    return buildTopicMetrics(group, currentItems.length, channelAvgViews, channelMedianViews);
   });
 
   const emergingTopics = identifyEmergingTopics(topics, range);
@@ -2791,7 +2637,7 @@ function computeContentTopics(classified, range) {
     .filter(function (t) { return t.breakoutCount >= 2; })
     .sort(function (a, b) { return b.breakoutCount - a.breakoutCount; });
 
-  const insights = buildTopicInsights(topics, emergingTopics, breakoutTopics, channelAvgLos);
+  const insights = buildTopicInsights(topics, emergingTopics, breakoutTopics, channelAvgViews);
 
   return {
     periodLabel: formatDate(bounds.start.toISOString()) + " – " + formatDate(bounds.end.toISOString()),
@@ -3215,12 +3061,9 @@ function PerformanceMetricTile(props) {
 
 function TopVideosSortToggle(props) {
   const options = [
-    { id: "los", label: "LOS" },
-    { id: "logZ", label: "Log z" },
-    { id: "vps", label: "VPS" },
+    { id: "views", label: "Views" },
     { id: "viewsPerDay", label: "Views/day" },
     { id: "engagement", label: "Engagement" },
-    { id: "views", label: "Views" },
   ];
   return (
     <div className="inline-flex rounded-lg border border-slate-200 bg-white p-0.5 shadow-sm">
@@ -3304,26 +3147,19 @@ function TopPerformanceVideoRow(props) {
   const video = props.video;
   const rank = props.rank;
   const showFormat = props.showFormat;
-  const sortBy = props.sortBy || "los";
-  let primaryValue = formatLosScore(video.los);
-  let primaryHint = " LOS";
-  if (sortBy === "logZ") {
-    primaryValue = formatLogZScore(video.logZ);
-    primaryHint = " z";
-  } else if (sortBy === "vps") {
-    primaryValue = formatVpsRatio(video.vps);
-    primaryHint = "";
-  } else if (sortBy === "viewsPerDay") {
+  const sortBy = props.sortBy || "views";
+  let primaryValue = formatNumber(video.viewCount);
+  let primaryHint = "views";
+  if (sortBy === "viewsPerDay") {
     primaryValue = formatNumber(video.viewsPerDay);
     primaryHint = "/day";
   } else if (sortBy === "engagement") {
     primaryValue = formatPercent(video.engagementRate);
     primaryHint = "";
-  } else if (sortBy === "views") {
-    primaryValue = formatNumber(video.viewCount);
-    primaryHint = " views";
   }
-  const secondaryValue = formatNumber(video.viewCount) + " views · LOS " + formatLosScore(video.los);
+  const secondaryValue = sortBy === "views"
+    ? formatNumber(video.viewsPerDay) + "/day"
+    : formatNumber(video.viewCount) + " views";
   return (
     <li className="rounded-lg border border-slate-100 bg-white px-3 py-2.5 shadow-sm">
       <div className="flex items-start gap-3">
@@ -3355,7 +3191,7 @@ function TopPerformanceVideoRow(props) {
             {formatNumber(video.likeCount)} likes · {formatNumber(video.commentCount)} comments · {formatDate(video.publishedAt)}
             {video.isBreakout && video.breakoutRatio > 0 && (
               <span className="text-amber-700">
-                {" "}· {formatLosScore(video.breakoutRatio)} local typical
+                {" "}· {formatBreakoutMultiplier(video.breakoutRatio)} typical
                 {showFormat && video.category === "short" ? " Short" : ""}
                 {showFormat && video.category === "long" ? " long-form" : ""}
                 {showFormat && video.category === "live" ? " Live" : ""}
@@ -3379,7 +3215,7 @@ function ContentPerformancePanel(props) {
   const perf = props.performance;
   const range = props.range;
   const [contentFormat, setContentFormat] = useState("all");
-  const [topVideosSort, setTopVideosSort] = useState("los");
+  const [topVideosSort, setTopVideosSort] = useState("views");
   const [showAllTopVideos, setShowAllTopVideos] = useState(false);
   if (!perf) return null;
 
@@ -3400,7 +3236,7 @@ function ContentPerformancePanel(props) {
   function handleFormatChange(next) {
     setContentFormat(next);
     setShowAllTopVideos(false);
-    setTopVideosSort("los");
+    setTopVideosSort("views");
   }
 
   const recent = active.recentPerformance || {};
@@ -3413,30 +3249,32 @@ function ContentPerformancePanel(props) {
   const canShowMoreTopVideos = rankedTopVideos.length > 3;
   const breakoutCount = active.breakoutCount || 0;
   const avgBreakoutMultiplier = active.avgBreakoutMultiplier || 0;
-  const breakoutHint = "Breakout means LOS ≥ 2.0 — views divided by the median of the nearest uploads in the same format (long-form, Shorts, or Live), sorted by publish date.";
+  const breakoutHint = contentFormat === "all"
+    ? "Breakout uses each video's own format baseline — long-form vs long-form median, Shorts vs Shorts median, Live vs Live median."
+    : "Breakout means at least 2× the typical (median) views for " + formatLabels[contentFormat] + " in this period.";
   const typicalHint = contentFormat === "all"
     ? "Combined view range across all content in this period."
     : "The view range where most " + formatLabels[contentFormat] + " videos in this period landed.";
   const summaryMetrics = [
     {
-      label: "Avg LOS",
-      value: formatLosScore(active.avgLos),
-      hint: "Local Outlier Score: views divided by the median of neighbouring uploads in the same format. >2.0 = outperformer, 0.8–1.2 = normal, <0.5 = flop.",
-    },
-    {
-      label: "Avg log z-score",
-      value: formatLogZScore(active.avgLogZ),
-      hint: "How far above or below local neighbours this period is on a log-views scale. Uses ln(views+1) and sample standard deviation.",
-    },
-    {
-      label: "Avg VPS",
-      value: formatVpsRatio(active.avgVps),
-      hint: "Views per subscriber using today's public subscriber count for all videos. YouTube rounds subscriber counts to 3 significant figures.",
+      label: "Average views/video",
+      value: formatNumber(active.avgViews),
+      hint: "Total views divided by the number of " + formatLabels[contentFormat] + " videos published in this period.",
     },
     {
       label: "Median views/video",
       value: formatNumber(active.medianViews),
-      hint: "Raw view middle value for " + formatLabels[contentFormat] + " in this period (age-confounded; prefer LOS for comparisons).",
+      hint: "The middle result for " + formatLabels[contentFormat] + ". Half earned more, half earned less — less affected by one viral hit than the average.",
+    },
+    {
+      label: "Avg views/day",
+      value: formatNumber(active.avgViewsPerDay),
+      hint: "Average views per day since publish, for " + formatLabels[contentFormat] + " in this period.",
+    },
+    {
+      label: "Engagement",
+      value: formatPercent(active.avgEngagement),
+      hint: "Average (likes + comments) ÷ views for " + formatLabels[contentFormat] + ", as a percentage.",
     },
   ];
   const trend = active.performanceTrend || [];
@@ -3449,7 +3287,7 @@ function ContentPerformancePanel(props) {
     <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm sm:p-5">
       <PanelSectionHeader
         title={
-          <PanelTitle hint="How well videos perform in the selected period — LOS (local outlier score), log z-score, VPS, and trends. Rankings use LOS by default, not raw views.">
+          <PanelTitle hint="How well videos perform in the selected period — views, engagement, outliers, and trends. Analyze all content or filter by long-form, Shorts, or Live.">
             Content Performance
           </PanelTitle>
         }
@@ -3708,8 +3546,8 @@ function TopicVideoRow(props) {
           </p>
         </div>
         <div className="shrink-0 text-right">
-          <p className="text-sm font-bold text-slate-900">{formatLosScore(video.los)}</p>
-          <p className="text-[11px] text-slate-400">{formatNumber(video.viewCount)} views</p>
+          <p className="text-sm font-bold text-slate-900">{formatNumber(video.viewCount)}</p>
+          <p className="text-[11px] text-slate-400">views</p>
         </div>
       </div>
     </li>
@@ -3726,7 +3564,7 @@ function TopicCard(props) {
       ? "border-rose-100 bg-rose-50/30"
       : "border-slate-100 bg-slate-50/50";
   const videos = (topic.videos || []).slice().sort(function (a, b) {
-    return (b.los || 0) - (a.los || 0);
+    return b.viewCount - a.viewCount;
   });
 
   return (
@@ -3750,8 +3588,6 @@ function TopicCard(props) {
             {formatNumber(topic.avgViews)} avg views
             <span className="text-slate-300"> · </span>
             {formatNumber(topic.medianViews)} median
-            <span className="text-slate-300"> · </span>
-            LOS {formatLosScore(topic.avgLos)}
             <span className="text-slate-300"> · </span>
             <span className={
               topic.performanceTier === "high" ? "font-semibold text-emerald-700" :
@@ -5204,7 +5040,7 @@ function App() {
                   label="Subscribers"
                   value={result.channel.subscriberCount !== null ? formatNumber(result.channel.subscriberCount) : "Hidden"}
                   note="public count"
-                  hint="Public subscriber count from YouTube (rounded to 3 significant figures). VPS uses this current count for all videos, including older uploads."
+                  hint="Public subscriber count from YouTube. Shows as Hidden if the channel hides subscriber numbers."
                 />
                 <StatCard
                   icon={<IconFilm className="h-4 w-4" />}
