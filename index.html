@@ -2582,14 +2582,15 @@ function formatVsChannelAvg(ratio) {
   return formatBreakoutMultiplier(ratio) + " channel average";
 }
 
-function computeContentTopics(classified, range) {
-  const bounds = getRangeBounds(range);
-  const videos = performanceVideos(classified);
-  const currentItems = filterByBounds(videos, bounds.start, bounds.end);
+function filterVideosByContentFormat(videos, contentFormat) {
+  if (!contentFormat || contentFormat === "all") return videos;
+  return videos.filter(function (v) { return v.category === contentFormat; });
+}
 
+function computeContentTopicsSlice(currentItems, range, periodLabel) {
   if (!currentItems.length) {
     return {
-      periodLabel: formatDate(bounds.start.toISOString()) + " – " + formatDate(bounds.end.toISOString()),
+      periodLabel: periodLabel,
       hasData: false,
       topics: [],
       emergingTopics: [],
@@ -2614,7 +2615,7 @@ function computeContentTopics(classified, range) {
 
   if (!classifiedItems.length) {
     return {
-      periodLabel: formatDate(bounds.start.toISOString()) + " – " + formatDate(bounds.end.toISOString()),
+      periodLabel: periodLabel,
       hasData: true,
       topics: [],
       emergingTopics: [],
@@ -2640,7 +2641,7 @@ function computeContentTopics(classified, range) {
   const insights = buildTopicInsights(topics, emergingTopics, breakoutTopics, channelAvgViews);
 
   return {
-    periodLabel: formatDate(bounds.start.toISOString()) + " – " + formatDate(bounds.end.toISOString()),
+    periodLabel: periodLabel,
     hasData: true,
     topics: topics,
     emergingTopics: emergingTopics,
@@ -2650,6 +2651,24 @@ function computeContentTopics(classified, range) {
     classificationComplete: classificationComplete,
     classifiedCount: classifiedItems.length,
     pendingCount: pendingCount,
+  };
+}
+
+function computeContentTopics(classified, range) {
+  const bounds = getRangeBounds(range);
+  const videos = performanceVideos(classified);
+  const currentAll = filterByBounds(videos, bounds.start, bounds.end);
+  const periodLabel = formatDate(bounds.start.toISOString()) + " – " + formatDate(bounds.end.toISOString());
+
+  return {
+    periodLabel: periodLabel,
+    hasData: currentAll.length > 0,
+    formats: {
+      all: computeContentTopicsSlice(currentAll, range, periodLabel),
+      long: computeContentTopicsSlice(currentAll.filter(function (it) { return it.category === "long"; }), range, periodLabel),
+      short: computeContentTopicsSlice(currentAll.filter(function (it) { return it.category === "short"; }), range, periodLabel),
+      live: computeContentTopicsSlice(currentAll.filter(function (it) { return it.category === "live"; }), range, periodLabel),
+    },
   };
 }
 
@@ -3622,21 +3641,37 @@ function TopicCard(props) {
 }
 
 function ContentTopicsPanel(props) {
-  const data = props.topics;
+  const topicsRoot = props.topics;
   const range = props.range;
+  const [contentFormat, setContentFormat] = useState("all");
   const [classifying, setClassifying] = useState(false);
   const [classifyMsg, setClassifyMsg] = useState("");
   const [classifyError, setClassifyError] = useState(null);
   const [expandedTopicId, setExpandedTopicId] = useState(null);
   const classifyGenRef = useRef(0);
+  const formatLabels = { all: "all content", long: "long-form", short: "Shorts", live: "Live" };
+  const formatEmptyMessages = {
+    all: "No videos published in this period to analyze topics.",
+    long: "No long-form videos published in this period to analyze topics.",
+    short: "No Shorts published in this period to analyze topics.",
+    live: "No live streams published in this period to analyze topics.",
+  };
+
+  const data = topicsRoot && topicsRoot.formats
+    ? topicsRoot.formats[contentFormat]
+    : topicsRoot;
+
   const unclassifiedCount = useMemo(function () {
     if (!props.allVideos || !props.allVideos.length) return 0;
     const bounds = getRangeBounds(props.range);
-    const periodVideos = filterByBounds(performanceVideos(props.allVideos), bounds.start, bounds.end);
+    const periodVideos = filterVideosByContentFormat(
+      filterByBounds(performanceVideos(props.allVideos), bounds.start, bounds.end),
+      contentFormat
+    );
     return periodVideos.filter(function (v) {
       return !isValidTopicClassification(v.topicClassification);
     }).length;
-  }, [props.allVideos, props.range]);
+  }, [props.allVideos, props.range, contentFormat]);
 
   useEffect(function () {
     classifyGenRef.current++;
@@ -3644,6 +3679,10 @@ function ContentTopicsPanel(props) {
     setClassifyMsg("");
     setClassifyError(null);
   }, [props.channelId]);
+
+  useEffect(function () {
+    setExpandedTopicId(null);
+  }, [contentFormat, props.range]);
 
   const runClassification = useCallback(function () {
     if (!props.channelId || !props.allVideos || !props.allVideos.length || !unclassifiedCount || classifying) return;
@@ -3654,7 +3693,10 @@ function ContentTopicsPanel(props) {
 
     const gen = ++classifyGenRef.current;
     const bounds = getRangeBounds(range);
-    const periodVideos = filterByBounds(performanceVideos(props.allVideos), bounds.start, bounds.end);
+    const periodVideos = filterVideosByContentFormat(
+      filterByBounds(performanceVideos(props.allVideos), bounds.start, bounds.end),
+      contentFormat
+    );
     const priorityIds = {};
     periodVideos.forEach(function (v) { priorityIds[v.id] = true; });
 
@@ -3688,9 +3730,9 @@ function ContentTopicsPanel(props) {
     }).finally(function () {
       if (gen === classifyGenRef.current) setClassifying(false);
     });
-  }, [props.channelId, props.allVideos, props.onClassificationsUpdated, props.canUseGemini, unclassifiedCount, classifying, range]);
+  }, [props.channelId, props.allVideos, props.onClassificationsUpdated, props.canUseGemini, unclassifiedCount, classifying, range, contentFormat]);
 
-  if (!data) return null;
+  if (!topicsRoot || !data) return null;
 
   const hasTopicResults = data.topics && data.topics.length > 0;
   const canRunClassification = data.hasData && unclassifiedCount > 0 && props.canUseGemini !== false && !hasTopicResults && !classifying;
@@ -3700,7 +3742,7 @@ function ContentTopicsPanel(props) {
     <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm sm:p-5">
       <PanelSectionHeader
         title={
-          <PanelTitle hint="What topics this channel covers, how much focus each gets, which perform best, and how the mix is shifting. Click Run to classify new videos with Gemini AI — already-classified videos are loaded from the database without using Gemini.">
+          <PanelTitle hint="What topics this channel covers, how much focus each gets, which perform best, and how the mix is shifting. Filter by long-form, Shorts, or Live so formats are not mixed. Click Run to classify new videos with Gemini AI.">
             Content Topics
           </PanelTitle>
         }
@@ -3726,9 +3768,14 @@ function ContentTopicsPanel(props) {
             />
           </>
         }
-      />
-      {data.periodLabel && (
-        <p className="mt-2 text-[11px] text-slate-400">{data.periodLabel}</p>
+      >
+        <ContentFormatSelector value={contentFormat} onChange={setContentFormat} />
+      </PanelSectionHeader>
+      {topicsRoot.periodLabel && (
+        <p className="mt-2 text-[11px] text-slate-400">
+          {topicsRoot.periodLabel}
+          {contentFormat !== "all" ? " · " + formatLabels[contentFormat] : ""}
+        </p>
       )}
 
       {geminiDisabled && (
@@ -3749,8 +3796,10 @@ function ContentTopicsPanel(props) {
         </div>
       )}
 
-      {!data.hasData ? (
+      {!topicsRoot.hasData ? (
         <p className="mt-4 text-sm text-slate-500">No videos published in this period to analyze topics.</p>
+      ) : !data.hasData ? (
+        <p className="mt-4 text-sm text-slate-500">{formatEmptyMessages[contentFormat]}</p>
       ) : data.topics.length === 0 && classifying ? (
         <p className="mt-4 text-sm text-slate-500">
           Analyzing video topics for this period. Results will appear shortly.
@@ -3774,7 +3823,7 @@ function ContentTopicsPanel(props) {
       ) : (
         <>
           <div className="mt-4">
-            <InsightSectionTitle hint="Meaningful topic categories assigned by Gemini AI. Metrics are calculated locally from video performance data.">
+            <InsightSectionTitle hint={"Meaningful topic categories assigned by Gemini AI for " + formatLabels[contentFormat] + ". Metrics use only this format's videos — long-form, Shorts, and Live are not mixed."}>
               Main topics
             </InsightSectionTitle>
             {!data.classificationComplete && data.pendingCount > 0 && (
