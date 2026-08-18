@@ -2864,10 +2864,16 @@ function buildTitleFormatPerformance(items) {
   items.forEach(function (video) {
     const classified = classifyVideoTitle(video.title);
     groups[classified.primaryFormat].push({
+      id: video.id,
+      title: video.title || "",
+      publishedAt: video.publishedAt,
+      category: video.category,
       viewCount: video.viewCount || 0,
       likeCount: video.likeCount || 0,
       commentCount: video.commentCount || 0,
       engagementRate: videoEngagementRate(video),
+      charCount: countTitleChars(video.title),
+      wordCount: countTitleWords(video.title),
       characteristics: classified.characteristics,
     });
   });
@@ -2884,6 +2890,8 @@ function buildTitleFormatPerformance(items) {
     const engagements = entries.map(function (e) { return e.engagementRate; });
     const medianViews = medianValue(views);
 
+    entries.sort(function (a, b) { return b.viewCount - a.viewCount; });
+
     return {
       id: def.id,
       label: def.label,
@@ -2896,6 +2904,7 @@ function buildTitleFormatPerformance(items) {
       engagementRate: sum(engagements) / count,
       performanceIndex: channelMedianViews > 0 ? medianViews / channelMedianViews : 0,
       limitedSample: count < TITLE_FORMAT_MIN_INSIGHT_VIDEOS,
+      videos: entries,
     };
   }).filter(Boolean);
 
@@ -4370,8 +4379,52 @@ function TitleLengthPerformanceBlock(props) {
   );
 }
 
+function TitleFormatVideoRow(props) {
+  const video = props.video;
+  const showFormat = props.showFormat;
+  return (
+    <li className="rounded-lg border border-slate-100 bg-white px-3 py-2.5 shadow-sm">
+      <div className="flex items-start gap-3">
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-1.5">
+            <a
+              href={"https://www.youtube.com/watch?v=" + video.id}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="line-clamp-2 font-semibold text-slate-900 hover:text-sky-700"
+              onClick={function (e) { e.stopPropagation(); }}
+            >
+              {video.title}
+            </a>
+            {showFormat && (
+              <span className={"shrink-0 rounded-full px-1.5 py-0.5 text-[10px] font-semibold uppercase " + formatCategoryBadgeClass(video.category)}>
+                {formatCategoryLabel(video.category)}
+              </span>
+            )}
+          </div>
+          <p className="mt-1 text-xs text-slate-500">
+            {formatNumber(video.viewCount)} views · {formatNumber(video.likeCount)} likes · {formatDate(video.publishedAt)}
+            <span className="text-slate-400"> · {formatTitleMetric(video.charCount)} chars · {formatTitleMetric(video.wordCount)} words</span>
+          </p>
+        </div>
+        <div className="shrink-0 text-right">
+          <p className="text-sm font-bold text-slate-900">{formatPercent(video.engagementRate)}</p>
+          <p className="text-[11px] text-slate-400">engagement</p>
+        </div>
+      </div>
+    </li>
+  );
+}
+
 function TitleFormatPerformanceBlock(props) {
   const data = props.data;
+  const showContentFormat = props.showContentFormat;
+  const [expandedFormatId, setExpandedFormatId] = useState(null);
+
+  useEffect(function () {
+    setExpandedFormatId(null);
+  }, [data]);
+
   if (!data || !data.formats || !data.formats.length) return null;
 
   const best = data.bestFormatId
@@ -4381,6 +4434,13 @@ function TitleFormatPerformanceBlock(props) {
   const maxMedianViews = Math.max(1, chartFormats.reduce(function (max, f) {
     return Math.max(max, f.medianViews);
   }, 0));
+  const expandedFormat = expandedFormatId
+    ? data.formats.find(function (f) { return f.id === expandedFormatId; })
+    : null;
+
+  function toggleFormat(formatId) {
+    setExpandedFormatId(function (current) { return current === formatId ? null : formatId; });
+  }
 
   return (
     <div className="mt-5">
@@ -4407,7 +4467,9 @@ function TitleFormatPerformanceBlock(props) {
         </p>
       )}
 
-      <div className="mt-3 overflow-x-auto rounded-xl border border-slate-200">
+      <p className="mt-3 text-xs text-slate-500">Click a format row to see all videos in that title format.</p>
+
+      <div className="mt-2 overflow-x-auto rounded-xl border border-slate-200">
         <table className="min-w-full text-left text-sm">
           <thead className="bg-slate-50 text-[11px] font-semibold uppercase tracking-wide text-slate-500">
             <tr>
@@ -4424,33 +4486,66 @@ function TitleFormatPerformanceBlock(props) {
           <tbody className="divide-y divide-slate-100">
             {data.formats.map(function (row) {
               const isBest = row.id === data.bestFormatId;
+              const isExpanded = expandedFormatId === row.id;
               return (
-                <tr key={row.id} className={isBest ? "bg-emerald-50/50" : "bg-white"}>
-                  <td className="px-3 py-2.5 font-medium text-slate-900">
-                    <span className="inline-flex flex-wrap items-center gap-1.5">
-                      <span>{row.label}</span>
-                      {row.limitedSample && (
-                        <span className="rounded-full bg-amber-50 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-amber-700">
-                          Limited sample
+                <React.Fragment key={row.id}>
+                  <tr
+                    className={"cursor-pointer transition-colors hover:bg-slate-50 " + (isBest ? "bg-emerald-50/50" : "bg-white") + (isExpanded ? " ring-1 ring-inset ring-sky-200" : "")}
+                    onClick={function () { toggleFormat(row.id); }}
+                  >
+                    <td className="px-3 py-2.5 font-medium text-slate-900">
+                      <span className="inline-flex flex-wrap items-center gap-1.5">
+                        <span className={"inline-flex items-center gap-1 " + (isExpanded ? "text-sky-700" : "")}>
+                          <span className={"inline-block text-[10px] transition-transform " + (isExpanded ? "rotate-90 text-sky-600" : "text-slate-400")}>▶</span>
+                          <span>{row.label}</span>
                         </span>
-                      )}
-                    </span>
-                  </td>
-                  <td className="px-3 py-2.5 text-right text-slate-700">{row.count}</td>
-                  <td className="px-3 py-2.5 text-right font-semibold text-slate-900">{formatNumber(row.medianViews)}</td>
-                  <td className="px-3 py-2.5 text-right text-slate-700">{formatNumber(row.avgViews)}</td>
-                  <td className="px-3 py-2.5 text-right text-slate-700">{formatNumber(row.medianLikes)}</td>
-                  <td className="px-3 py-2.5 text-right text-slate-700">{formatNumber(row.medianComments)}</td>
-                  <td className="px-3 py-2.5 text-right text-slate-700">{formatPercent(row.engagementRate)}</td>
-                  <td className="px-3 py-2.5 text-right font-semibold text-slate-900">
-                    {row.performanceIndex > 0 ? formatBreakoutMultiplier(row.performanceIndex) : "—"}
-                  </td>
-                </tr>
+                        {row.limitedSample && (
+                          <span className="rounded-full bg-amber-50 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-amber-700">
+                            Limited sample
+                          </span>
+                        )}
+                      </span>
+                    </td>
+                    <td className="px-3 py-2.5 text-right text-slate-700">{row.count}</td>
+                    <td className="px-3 py-2.5 text-right font-semibold text-slate-900">{formatNumber(row.medianViews)}</td>
+                    <td className="px-3 py-2.5 text-right text-slate-700">{formatNumber(row.avgViews)}</td>
+                    <td className="px-3 py-2.5 text-right text-slate-700">{formatNumber(row.medianLikes)}</td>
+                    <td className="px-3 py-2.5 text-right text-slate-700">{formatNumber(row.medianComments)}</td>
+                    <td className="px-3 py-2.5 text-right text-slate-700">{formatPercent(row.engagementRate)}</td>
+                    <td className="px-3 py-2.5 text-right font-semibold text-slate-900">
+                      {row.performanceIndex > 0 ? formatBreakoutMultiplier(row.performanceIndex) : "—"}
+                    </td>
+                  </tr>
+                  {isExpanded && row.videos && row.videos.length > 0 && (
+                    <tr>
+                      <td colSpan={8} className="bg-slate-50 px-3 py-3">
+                        <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">
+                          {row.label} videos ({row.videos.length})
+                        </p>
+                        <ol className="mt-2 space-y-2">
+                          {row.videos.map(function (video) {
+                            return (
+                              <TitleFormatVideoRow
+                                key={video.id}
+                                video={video}
+                                showFormat={showContentFormat}
+                              />
+                            );
+                          })}
+                        </ol>
+                      </td>
+                    </tr>
+                  )}
+                </React.Fragment>
               );
             })}
           </tbody>
         </table>
       </div>
+
+      {expandedFormat && expandedFormat.videos && expandedFormat.videos.length === 0 && (
+        <p className="mt-2 text-sm text-slate-500">No videos found for this format.</p>
+      )}
 
       {chartFormats.length > 0 && (
         <div className="mt-4 rounded-xl bg-slate-50 p-3">
@@ -4462,19 +4557,25 @@ function TitleFormatPerformanceBlock(props) {
             {chartFormats.map(function (row) {
               const widthPct = maxMedianViews ? (row.medianViews / maxMedianViews) * 100 : 0;
               const isBest = row.id === data.bestFormatId;
+              const isExpanded = expandedFormatId === row.id;
               return (
-                <div key={row.id} className="grid grid-cols-[5.5rem_minmax(0,1fr)_3.5rem] items-center gap-2 sm:grid-cols-[7rem_minmax(0,1fr)_4rem]">
-                  <span className={"truncate text-[11px] font-medium " + (isBest ? "text-emerald-700" : "text-slate-600")}>
+                <button
+                  key={row.id}
+                  type="button"
+                  onClick={function () { toggleFormat(row.id); }}
+                  className={"grid w-full grid-cols-[5.5rem_minmax(0,1fr)_3.5rem] items-center gap-2 rounded-md px-1 py-0.5 text-left transition-colors hover:bg-white/70 sm:grid-cols-[7rem_minmax(0,1fr)_4rem] " + (isExpanded ? "bg-white ring-1 ring-sky-200" : "")}
+                >
+                  <span className={"truncate text-[11px] font-medium " + (isBest ? "text-emerald-700" : isExpanded ? "text-sky-700" : "text-slate-600")}>
                     {row.shortLabel}
                   </span>
                   <div className="h-2.5 overflow-hidden rounded-full bg-slate-200/80">
                     <div
-                      className={"h-full rounded-full transition-all " + (isBest ? "bg-emerald-500" : "bg-slate-700")}
+                      className={"h-full rounded-full transition-all " + (isBest ? "bg-emerald-500" : isExpanded ? "bg-sky-500" : "bg-slate-700")}
                       style={{ width: Math.max(widthPct, row.medianViews > 0 ? 4 : 0) + "%" }}
                     />
                   </div>
                   <span className="text-right text-[11px] font-semibold text-slate-700">{formatNumber(row.medianViews)}</span>
-                </div>
+                </button>
               );
             })}
           </div>
@@ -4585,7 +4686,7 @@ function TitleLabPanel(props) {
           </div>
 
           <TitleLengthPerformanceBlock data={active.titleLengthPerformance} />
-          <TitleFormatPerformanceBlock data={active.titleFormatPerformance} />
+          <TitleFormatPerformanceBlock data={active.titleFormatPerformance} showContentFormat={contentFormat === "all"} />
         </>
       )}
     </div>
