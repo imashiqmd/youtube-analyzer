@@ -2681,6 +2681,100 @@ function computeContentTopics(classified, range) {
 
 // ---------- title lab ----------
 
+const TITLE_CHAR_BUCKETS = [
+  { id: "under-45", label: "Under 45 chars", shortLabel: "<45", min: 0, max: 44 },
+  { id: "45-59", label: "45–59 chars", shortLabel: "45–59", min: 45, max: 59 },
+  { id: "60-74", label: "60–74 chars", shortLabel: "60–74", min: 60, max: 74 },
+  { id: "75-plus", label: "75+ chars", shortLabel: "75+", min: 75, max: Infinity },
+];
+const TITLE_LENGTH_MIN_BUCKET_VIDEOS = 2;
+
+function getTitleCharBucket(charCount) {
+  for (let i = 0; i < TITLE_CHAR_BUCKETS.length; i++) {
+    const bucket = TITLE_CHAR_BUCKETS[i];
+    if (charCount >= bucket.min && charCount <= bucket.max) return bucket;
+  }
+  return TITLE_CHAR_BUCKETS[TITLE_CHAR_BUCKETS.length - 1];
+}
+
+function buildTitleLengthPerformance(items) {
+  const bucketViews = {};
+  TITLE_CHAR_BUCKETS.forEach(function (bucket) {
+    bucketViews[bucket.id] = [];
+  });
+
+  items.forEach(function (video) {
+    const bucket = getTitleCharBucket(countTitleChars(video.title));
+    bucketViews[bucket.id].push(video.viewCount || 0);
+  });
+
+  const buckets = TITLE_CHAR_BUCKETS.map(function (def) {
+    const views = bucketViews[def.id];
+    const count = views.length;
+    const sum = views.reduce(function (a, b) { return a + b; }, 0);
+    return {
+      id: def.id,
+      label: def.label,
+      shortLabel: def.shortLabel,
+      count: count,
+      avgViews: count ? sum / count : 0,
+      medianViews: count ? medianValue(views) : 0,
+    };
+  });
+
+  const insightResult = buildTitleLengthInsight(buckets, items.length);
+  return {
+    buckets: buckets,
+    bestBucketId: insightResult.bestBucketId,
+    insight: insightResult.text,
+    hasEnoughData: insightResult.hasEnoughData,
+  };
+}
+
+function buildTitleLengthInsight(buckets, totalVideos) {
+  if (totalVideos < 3) {
+    return {
+      text: "Not enough videos in this period to compare title-length performance reliably.",
+      bestBucketId: null,
+      hasEnoughData: false,
+    };
+  }
+
+  const eligible = buckets.filter(function (bucket) {
+    return bucket.count >= TITLE_LENGTH_MIN_BUCKET_VIDEOS;
+  });
+
+  if (!eligible.length) {
+    return {
+      text: "Videos are spread across title lengths, but no single length range has enough uploads yet for a reliable comparison.",
+      bestBucketId: null,
+      hasEnoughData: false,
+    };
+  }
+
+  eligible.sort(function (a, b) {
+    if (b.avgViews !== a.avgViews) return b.avgViews - a.avgViews;
+    return b.count - a.count;
+  });
+
+  const best = eligible[0];
+  const runnerUp = eligible.length > 1 ? eligible[1] : null;
+  let text = "Titles with " + best.label.toLowerCase() + " averaged " + formatNumber(best.avgViews) + " views per video";
+  text += " — the strongest title-length range in this period";
+  text += " (" + best.count + " video" + (best.count === 1 ? "" : "s") + ").";
+
+  if (runnerUp && runnerUp.avgViews > 0 && best.avgViews > runnerUp.avgViews * 1.15) {
+    const lift = Math.round(((best.avgViews - runnerUp.avgViews) / runnerUp.avgViews) * 100);
+    text += " That's " + lift + "% above the next-best range (" + runnerUp.label.toLowerCase() + ").";
+  }
+
+  return {
+    text: text,
+    bestBucketId: best.id,
+    hasEnoughData: true,
+  };
+}
+
 function countTitleWords(title) {
   const trimmed = (title || "").trim();
   if (!trimmed) return 0;
@@ -2705,6 +2799,12 @@ function computeTitleLabSlice(currentItems, periodLabel) {
       maxCharCount: 0,
       minWordCount: 0,
       maxWordCount: 0,
+      titleLengthPerformance: {
+        buckets: [],
+        bestBucketId: null,
+        insight: null,
+        hasEnoughData: false,
+      },
     };
   }
 
@@ -2724,6 +2824,7 @@ function computeTitleLabSlice(currentItems, periodLabel) {
     maxCharCount: Math.max.apply(null, charCounts),
     minWordCount: Math.min.apply(null, wordCounts),
     maxWordCount: Math.max.apply(null, wordCounts),
+    titleLengthPerformance: buildTitleLengthPerformance(currentItems),
   };
 }
 
@@ -4022,6 +4123,77 @@ function ContentTopicsPanel(props) {
   );
 }
 
+function TitleLengthPerformanceBlock(props) {
+  const data = props.data;
+  if (!data || !data.buckets || !data.buckets.length) return null;
+
+  const maxViews = Math.max(1, data.buckets.reduce(function (max, bucket) {
+    return Math.max(max, bucket.avgViews);
+  }, 0));
+
+  return (
+    <div className="mt-5">
+      <InsightSectionTitle hint="Videos grouped by title character count. Bars show average views per video in each length range. The best-performing range needs at least 2 videos.">
+        Performance by title length
+      </InsightSectionTitle>
+      {data.insight && (
+        <p className={"mt-2 text-sm leading-relaxed " + (data.hasEnoughData ? "text-slate-700" : "text-slate-500")}>
+          {data.insight}
+        </p>
+      )}
+      <div className="mt-3 rounded-xl bg-slate-50 p-3">
+        <div className="mb-2 flex items-center justify-between gap-2 text-[11px] text-slate-400">
+          <span>Character-length buckets</span>
+          <span>Avg views / video</span>
+        </div>
+        <div className="flex h-32 items-end gap-2">
+          {data.buckets.map(function (bucket) {
+            const heightPct = maxViews ? (bucket.avgViews / maxViews) * 100 : 0;
+            const isBest = bucket.id === data.bestBucketId;
+            const barColor = isBest
+              ? "bg-emerald-500 group-hover:bg-emerald-600"
+              : bucket.count > 0
+                ? "bg-slate-700 group-hover:bg-slate-900"
+                : "bg-slate-200";
+            return (
+              <div
+                key={bucket.id}
+                className="group relative flex min-w-0 flex-1 flex-col items-center rounded-md transition-colors hover:bg-white/70"
+              >
+                <div className="pointer-events-none absolute bottom-full left-1/2 z-10 mb-2 hidden -translate-x-1/2 group-hover:block">
+                  <div className="whitespace-nowrap rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-[11px] shadow-md">
+                    <div className="font-semibold text-slate-900">{bucket.label}</div>
+                    <div className="mt-0.5 text-slate-600">
+                      {bucket.count > 0
+                        ? formatNumber(bucket.avgViews) + " avg views · " + formatNumber(bucket.medianViews) + " median"
+                        : "No videos in this range"}
+                      {bucket.count > 0 && (
+                        <span className="text-slate-400"> · {bucket.count} video{bucket.count === 1 ? "" : "s"}</span>
+                      )}
+                    </div>
+                  </div>
+                </div>
+                <div className="flex h-24 w-full items-end justify-center px-0.5">
+                  <div
+                    className={"w-full max-w-10 rounded-t-md transition-all " + barColor}
+                    style={{ height: heightPct + "%", minHeight: bucket.avgViews > 0 ? 4 : 0 }}
+                  />
+                </div>
+                <span className={"mt-1.5 text-center text-[10px] font-medium " + (isBest ? "text-emerald-700" : "text-slate-500 group-hover:text-slate-900")}>
+                  {bucket.shortLabel}
+                </span>
+                <span className="mt-0.5 text-center text-[10px] text-slate-400">
+                  {bucket.count > 0 ? formatNumber(bucket.avgViews) : "—"}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function TitleLabPanel(props) {
   const titleLab = props.titleLab;
   const range = props.range;
@@ -4064,7 +4236,7 @@ function TitleLabPanel(props) {
     <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm sm:p-5">
       <PanelSectionHeader
         title={
-          <PanelTitle hint="Title length patterns for videos in the selected period — character and word counts per title, with averages and medians. Filter by long-form, Shorts, or Live so formats are not mixed.">
+          <PanelTitle hint="Title length patterns and performance for videos in the selected period — character and word counts, length buckets, and which title-length range performs best. Filter by long-form, Shorts, or Live so formats are not mixed.">
             Title Lab
           </PanelTitle>
         }
@@ -4121,6 +4293,8 @@ function TitleLabPanel(props) {
               </div>
             )}
           </div>
+
+          <TitleLengthPerformanceBlock data={active.titleLengthPerformance} />
         </>
       )}
     </div>
