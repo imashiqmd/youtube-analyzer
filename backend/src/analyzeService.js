@@ -10,6 +10,7 @@ const CHANNEL_SELECT = `
   channel_data,
   video_ids,
   cached_videos,
+  topic_classifications,
   last_synced_at
 `;
 
@@ -193,6 +194,18 @@ export async function logQuotaUsage(client, { calls, channelId, requestSource, u
 }
 
 export function toAnalyzeResponse(row, rawVideos, source, unitsUsed) {
+  let topicClassifications = {};
+  if (row.topic_classifications) {
+    if (typeof row.topic_classifications === "string") {
+      try {
+        topicClassifications = JSON.parse(row.topic_classifications);
+      } catch {
+        topicClassifications = {};
+      }
+    } else if (typeof row.topic_classifications === "object") {
+      topicClassifications = row.topic_classifications;
+    }
+  }
   return {
     source,
     units_used: unitsUsed,
@@ -201,6 +214,7 @@ export function toAnalyzeResponse(row, rawVideos, source, unitsUsed) {
     channel: row.channel_data,
     videoIds: row.video_ids,
     rawVideos,
+    topicClassifications,
   };
 }
 

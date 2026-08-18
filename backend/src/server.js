@@ -22,6 +22,7 @@ import {
   getQuotaStats,
 } from "./adminService.js";
 import { getAppSettings, setMaxChannelsPerUser } from "./settingsService.js";
+import { getTopicClassifications, mergeTopicClassifications } from "./topicService.js";
 
 const app = express();
 const port = Number(process.env.PORT || 3001);
@@ -201,6 +202,38 @@ app.get("/channels/:channelId", requireAuth, async (req, res) => {
     await recordUserChannelAnalysis(req.user.id, channelId);
     const usage = await fetchUserChannelUsage(req.user.id, req.user.isAdmin);
     res.json({ ...result, usage });
+  } catch (err) {
+    const status = err.status || 500;
+    res.status(status).json({ error: err.message, code: err.code || undefined });
+  }
+});
+
+app.get("/channels/:channelId/topic-classifications", requireAuth, async (req, res) => {
+  try {
+    const channelId = req.params.channelId;
+    await assertUserCanAnalyzeChannel(req.user, channelId);
+    const topicClassifications = await getTopicClassifications(channelId);
+    res.json({ channelId, topicClassifications });
+  } catch (err) {
+    const status = err.status || 500;
+    res.status(status).json({ error: err.message, code: err.code || undefined });
+  }
+});
+
+app.put("/channels/:channelId/topic-classifications", requireAuth, async (req, res) => {
+  const classifications = req.body?.classifications;
+  if (!classifications || typeof classifications !== "object" || Array.isArray(classifications)) {
+    return res.status(400).json({ error: "classifications object is required." });
+  }
+  try {
+    const channelId = req.params.channelId;
+    await assertUserCanAnalyzeChannel(req.user, channelId);
+    const topicClassifications = await mergeTopicClassifications(channelId, classifications);
+    await logUserActivity(req.user.id, "save_topic_classifications", {
+      channelId,
+      metadata: { count: Object.keys(classifications).length },
+    });
+    res.json({ channelId, topicClassifications });
   } catch (err) {
     const status = err.status || 500;
     res.status(status).json({ error: err.message, code: err.code || undefined });

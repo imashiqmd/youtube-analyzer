@@ -125,17 +125,72 @@ function apiResponseToCacheEntry(data) {
     channel: data.channel,
     videoIds: data.videoIds || (data.rawVideos || []).map(function (v) { return v.id; }),
     rawVideos: data.rawVideos || [],
-    topicClassifications: {},
+    topicClassifications: data.topicClassifications || {},
   };
 }
 
-async function mergeLocalTopicClassifications(entry) {
+async function fetchTopicClassificationsFromApi(channelId) {
+  if (!API_BASE || !getStoredAuthToken() || !channelId) return {};
+  const data = await apiRequest("/channels/" + encodeURIComponent(channelId) + "/topic-classifications");
+  return data.topicClassifications || {};
+}
+
+async function saveTopicClassificationsToApi(channelId, classifications) {
+  if (!API_BASE || !getStoredAuthToken() || !channelId) return null;
+  const payload = classifications || {};
+  if (!Object.keys(payload).length) return null;
+  const data = await apiRequest("/channels/" + encodeURIComponent(channelId) + "/topic-classifications", {
+    method: "PUT",
+    body: { classifications: payload },
+  });
+  return data.topicClassifications || null;
+}
+
+async function applyTopicClassificationsToVideos(channelId, videos, topicMap) {
+  if (!videos || !videos.length || !topicMap) return;
+  for (let i = 0; i < videos.length; i++) {
+    const video = videos[i];
+    const videoId = video.id || video.videoId;
+    if (!videoId) continue;
+    const classification = topicMap[videoId];
+    if (!isValidTopicClassification(classification)) continue;
+    video.topicClassification = classification;
+    await saveVideoTopicClassification(channelId, videoId, classification, { skipApi: true });
+  }
+}
+
+async function mergeTopicClassificationsFromCache(entry) {
+  let serverMap = entry.topicClassifications || {};
+  if (API_BASE && getStoredAuthToken() && entry.channelId) {
+    try {
+      const apiMap = await fetchTopicClassificationsFromApi(entry.channelId);
+      serverMap = Object.assign({}, serverMap, apiMap);
+      entry.topicClassifications = serverMap;
+    } catch (e) {
+      console.warn("Could not load topic classifications from server:", e);
+    }
+  }
+
   try {
     const local = await loadChannelCache(entry.channelId);
-    if (local && local.topicClassifications) {
-      entry.topicClassifications = Object.assign({}, local.topicClassifications, entry.topicClassifications || {});
+    const localMap = (local && local.topicClassifications) ? local.topicClassifications : {};
+    entry.topicClassifications = Object.assign({}, localMap, serverMap);
+
+    if (API_BASE && getStoredAuthToken() && entry.channelId) {
+      const toUpload = {};
+      Object.keys(localMap).forEach(function (videoId) {
+        const localClass = localMap[videoId];
+        if (isValidTopicClassification(localClass) && !isValidTopicClassification(serverMap[videoId])) {
+          toUpload[videoId] = localClass;
+        }
+      });
+      if (Object.keys(toUpload).length) {
+        const merged = await saveTopicClassificationsToApi(entry.channelId, toUpload);
+        if (merged) entry.topicClassifications = Object.assign({}, entry.topicClassifications, merged);
+      }
     }
   } catch (e) { /* keep server data */ }
+
   return entry;
 }
 
@@ -515,8 +570,9 @@ async function loadChannelCache(channelId) {
   }
 }
 
-async function putVideoRecords(store, channelId, rawVideos, existingByVideoId) {
+async function putVideoRecords(store, channelId, rawVideos, existingByVideoId, topicClassifications) {
   const existingMap = existingByVideoId || {};
+  const topicMap = topicClassifications || {};
   for (let i = 0; i < rawVideos.length; i++) {
     const raw = compactRawVideo(rawVideos[i]);
     if (!raw || !raw.id) continue;
@@ -531,11 +587,14 @@ async function putVideoRecords(store, channelId, rawVideos, existingByVideoId) {
     if (existing && existing.topicClassification) {
       record.topicClassification = existing.topicClassification;
     }
+    if (isValidTopicClassification(topicMap[raw.id])) {
+      record.topicClassification = topicMap[raw.id];
+    }
     await idbRequest(store.put(record));
   }
 }
 
-async function saveChannelVideos(channelId, rawVideos) {
+async function saveChannelVideos(channelId, rawVideos, topicClassifications) {
   if (!rawVideos || !rawVideos.length) return;
   const db = await openChannelCacheDb();
   const tx = db.transaction(VIDEO_STORE, "readwrite");
@@ -546,11 +605,12 @@ async function saveChannelVideos(channelId, rawVideos) {
   (existingRecords || []).forEach(function (record) {
     if (record && record.videoId) existingByVideoId[record.videoId] = record;
   });
-  await putVideoRecords(store, channelId, rawVideos, existingByVideoId);
+  await putVideoRecords(store, channelId, rawVideos, existingByVideoId, topicClassifications);
   await waitTransaction(tx);
 }
 
-async function saveVideoTopicClassification(channelId, videoId, classification) {
+async function saveVideoTopicClassification(channelId, videoId, classification, options) {
+  const opts = options || {};
   const db = await openChannelCacheDb();
   const key = videoRecordKey(channelId, videoId);
   const tx = db.transaction(VIDEO_STORE, "readwrite");
@@ -600,9 +660,11 @@ async function saveChannelCache(entry) {
 
   const channelMeta = toChannelMeta(normalized);
   await saveChannelMeta(channelMeta);
-  await saveChannelVideos(normalized.channelId, normalized.rawVideos);
-  memoryChannelCache.set(normalized.channelId, normalized);
-  return normalized;
+  await saveChannelVideos(normalized.channelId, normalized.rawVideos, entry.topicClassifications);
+  memoryChannelCache.set(normalized.channelId, Object.assign({}, normalized, {
+    topicClassifications: entry.topicClassifications || {},
+  }));
+  return Object.assign({}, normalized, { topicClassifications: entry.topicClassifications || {} });
 }
 
 async function appendChannelVideos(channelId, channelMeta, newRawVideos) {
@@ -2171,6 +2233,15 @@ async function classifyVideosWithGemini(channelId, videos, options) {
   const onProgress = opts.onProgress;
   const periodOnly = opts.periodOnly !== false;
 
+  if (API_BASE && getStoredAuthToken() && channelId) {
+    try {
+      const serverMap = await fetchTopicClassificationsFromApi(channelId);
+      await applyTopicClassificationsToVideos(channelId, videos, serverMap);
+    } catch (e) {
+      console.warn("Could not load cached topic classifications:", e);
+    }
+  }
+
   let unclassified = videos.filter(function (v) {
     return !isValidTopicClassification(v.topicClassification);
   });
@@ -2218,19 +2289,29 @@ async function classifyVideosWithGemini(channelId, videos, options) {
       if (row && row.videoId) resultMap[row.videoId] = row;
     });
 
+    const batchSaved = {};
     for (let j = 0; j < batch.length; j++) {
       const video = batch[j];
       const row = resultMap[video.id];
       if (!row) continue;
       const classification = normalizeTopicClassification(row);
       if (!classification) continue;
-      await saveVideoTopicClassification(channelId, video.id, classification);
+      await saveVideoTopicClassification(channelId, video.id, classification, { skipApi: true });
       video.topicClassification = classification;
+      batchSaved[video.id] = classification;
       if (classification.primaryTopic !== "Other") {
         existingTopics[classification.primaryTopic] = true;
         topicList = Object.keys(existingTopics);
       }
       classified++;
+    }
+
+    if (Object.keys(batchSaved).length) {
+      try {
+        await saveTopicClassificationsToApi(channelId, batchSaved);
+      } catch (e) {
+        console.warn("Could not save topic classifications to server:", e);
+      }
     }
 
     if (i + GEMINI_BATCH_SIZE < unclassified.length) {
@@ -3527,7 +3608,7 @@ function ContentTopicsPanel(props) {
     <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm sm:p-5">
       <PanelSectionHeader
         title={
-          <PanelTitle hint="What topics this channel covers, how much focus each gets, which perform best, and how the mix is shifting. Click Run to classify videos with Gemini AI — this uses API tokens and does not start automatically.">
+          <PanelTitle hint="What topics this channel covers, how much focus each gets, which perform best, and how the mix is shifting. Click Run to classify new videos with Gemini AI — already-classified videos are loaded from the database without using Gemini.">
             Content Topics
           </PanelTitle>
         }
@@ -4435,7 +4516,7 @@ function App() {
       if (gen !== analysisGenRef.current) return;
       if (response.usage) setChannelUsage(response.usage);
       let entry = response.entry;
-      entry = await mergeLocalTopicClassifications(entry);
+      entry = await mergeTopicClassificationsFromCache(entry);
       if (gen !== analysisGenRef.current) return;
       await saveChannelCache(entry);
       if (gen !== analysisGenRef.current) return;
@@ -4531,7 +4612,7 @@ function App() {
         if (gen !== analysisGenRef.current) return;
         if (response.usage) setChannelUsage(response.usage);
         let entry = response.entry;
-        entry = await mergeLocalTopicClassifications(entry);
+        entry = await mergeTopicClassificationsFromCache(entry);
         setActivityRange(DEFAULT_ACTIVITY_RANGE);
         setContentPerformanceRange(DEFAULT_ACTIVITY_RANGE);
         setContentTopicsRange(DEFAULT_ACTIVITY_RANGE);
