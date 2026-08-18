@@ -21,7 +21,7 @@ import {
   listQuotaLogs,
   getQuotaStats,
 } from "./adminService.js";
-import { getAppSettings, setMaxChannelsPerUser } from "./settingsService.js";
+import { getAppSettings, setMaxChannelsPerUser, setGeminiEnabledForUsers, assertGeminiAllowedForUser, canUserUseGemini, getGeminiEnabledForUsers } from "./settingsService.js";
 import { getTopicClassifications, mergeTopicClassifications } from "./topicService.js";
 
 const app = express();
@@ -152,7 +152,15 @@ app.get("/auth/me", async (req, res) => {
       return res.status(401).json({ error: "Not signed in." });
     }
     const usage = await fetchUserChannelUsage(user.id, user.isAdmin);
-    res.json({ user, usage });
+    const geminiEnabledForUsers = await getGeminiEnabledForUsers();
+    res.json({
+      user,
+      usage,
+      features: {
+        geminiTopicAnalysis: canUserUseGemini(user, geminiEnabledForUsers),
+        geminiEnabledForUsers,
+      },
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -228,6 +236,7 @@ app.put("/channels/:channelId/topic-classifications", requireAuth, async (req, r
   try {
     const channelId = req.params.channelId;
     await assertUserCanAnalyzeChannel(req.user, channelId);
+    await assertGeminiAllowedForUser(req.user);
     const topicClassifications = await mergeTopicClassifications(channelId, classifications);
     await logUserActivity(req.user.id, "save_topic_classifications", {
       channelId,
@@ -293,16 +302,25 @@ app.get("/admin/settings", requireAdmin, async (_req, res) => {
 });
 
 app.put("/admin/settings", requireAdmin, async (req, res) => {
-  const maxChannelsPerUser = req.body?.maxChannelsPerUser;
-  if (maxChannelsPerUser === undefined || maxChannelsPerUser === null) {
-    return res.status(400).json({ error: "maxChannelsPerUser is required." });
+  const hasChannelLimit = req.body?.maxChannelsPerUser !== undefined && req.body?.maxChannelsPerUser !== null;
+  const hasGeminiToggle = req.body?.geminiEnabledForUsers !== undefined && req.body?.geminiEnabledForUsers !== null;
+  if (!hasChannelLimit && !hasGeminiToggle) {
+    return res.status(400).json({ error: "No settings to update." });
   }
   try {
-    const value = await setMaxChannelsPerUser(maxChannelsPerUser);
-    await logUserActivity(req.user.id, "update_channel_limit", {
-      metadata: { maxChannelsPerUser: value },
-    });
-    res.json({ maxChannelsPerUser: value });
+    if (hasChannelLimit) {
+      const value = await setMaxChannelsPerUser(req.body.maxChannelsPerUser);
+      await logUserActivity(req.user.id, "update_channel_limit", {
+        metadata: { maxChannelsPerUser: value },
+      });
+    }
+    if (hasGeminiToggle) {
+      const value = await setGeminiEnabledForUsers(req.body.geminiEnabledForUsers);
+      await logUserActivity(req.user.id, "update_gemini_access", {
+        metadata: { geminiEnabledForUsers: value },
+      });
+    }
+    res.json(await getAppSettings());
   } catch (err) {
     const status = err.status || 500;
     res.status(status).json({ error: err.message });

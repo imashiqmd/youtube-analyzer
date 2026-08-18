@@ -2229,6 +2229,11 @@ async function callGeminiJson(prompt) {
 
 async function classifyVideosWithGemini(channelId, videos, options) {
   const opts = options || {};
+  if (opts.canUseGemini === false) {
+    const err = new Error("AI topic analysis is currently turned off for users. Please contact an admin.");
+    err.code = "GEMINI_DISABLED";
+    throw err;
+  }
   const priorityIds = opts.priorityIds || {};
   const onProgress = opts.onProgress;
   const periodOnly = opts.periodOnly !== false;
@@ -3567,6 +3572,10 @@ function ContentTopicsPanel(props) {
 
   const runClassification = useCallback(function () {
     if (!props.channelId || !props.allVideos || !props.allVideos.length || !unclassifiedCount || classifying) return;
+    if (props.canUseGemini === false) {
+      setClassifyError("AI topic analysis is currently turned off for users. Admins can still use it.");
+      return;
+    }
 
     const gen = ++classifyGenRef.current;
     const bounds = getRangeBounds(range);
@@ -3579,6 +3588,7 @@ function ContentTopicsPanel(props) {
     setClassifyMsg("Classifying topics with AI…");
 
     classifyVideosWithGemini(props.channelId, props.allVideos, {
+      canUseGemini: props.canUseGemini !== false,
       priorityIds: priorityIds,
       periodOnly: true,
       onProgress: function (done, total) {
@@ -3598,11 +3608,12 @@ function ContentTopicsPanel(props) {
     }).finally(function () {
       if (gen === classifyGenRef.current) setClassifying(false);
     });
-  }, [props.channelId, props.allVideos, props.onClassificationsUpdated, unclassifiedCount, classifying, range]);
+  }, [props.channelId, props.allVideos, props.onClassificationsUpdated, props.canUseGemini, unclassifiedCount, classifying, range]);
 
   if (!data) return null;
 
-  const canRunClassification = data.hasData && unclassifiedCount > 0;
+  const canRunClassification = data.hasData && unclassifiedCount > 0 && props.canUseGemini !== false;
+  const geminiDisabled = props.canUseGemini === false && unclassifiedCount > 0;
 
   return (
     <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm sm:p-5">
@@ -3637,6 +3648,12 @@ function ContentTopicsPanel(props) {
       />
       {data.periodLabel && (
         <p className="mt-2 text-[11px] text-slate-400">{data.periodLabel}</p>
+      )}
+
+      {geminiDisabled && (
+        <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2.5 text-sm text-amber-800">
+          AI topic analysis is turned off for users right now. You can still view topics already saved in the database.
+        </div>
       )}
 
       {(classifying || classifyError) && (
@@ -3682,7 +3699,7 @@ function ContentTopicsPanel(props) {
             {!data.classificationComplete && data.pendingCount > 0 && (
               <p className="mt-1 text-[11px] text-slate-500">
                 Showing {data.classifiedCount} classified video{data.classifiedCount === 1 ? "" : "s"} · {data.pendingCount} unclassified
-                {!classifying && canRunClassification ? " — click Run to classify the rest" : (classifying ? " · classifying…" : "")}
+                {!classifying && canRunClassification ? " — click Run to classify the rest" : (classifying ? " · classifying…" : (geminiDisabled ? " · AI analysis is currently disabled" : ""))}
               </p>
             )}
             {data.topics.some(function (t) { return t.performanceTier !== "average"; }) && (
@@ -4401,6 +4418,7 @@ function App() {
     return loadCachedAuthUser();
   });
   const [channelUsage, setChannelUsage] = useState(null);
+  const [geminiTopicAnalysis, setGeminiTopicAnalysis] = useState(true);
   const [authLoading, setAuthLoading] = useState(function () {
     if (!API_BASE) return false;
     return !!getStoredAuthToken() && !loadCachedAuthUser();
@@ -4435,6 +4453,7 @@ function App() {
       .then(function (data) {
         setAuthUser(data.user);
         setChannelUsage(data.usage || null);
+        setGeminiTopicAnalysis(data.features ? data.features.geminiTopicAnalysis !== false : true);
         persistCachedAuthUser(data.user);
         refreshSavedChannelsInBackground(setFavorites);
       })
@@ -4455,6 +4474,7 @@ function App() {
     clearAuthToken();
     setAuthUser(null);
     setChannelUsage(null);
+    setGeminiTopicAnalysis(true);
     setResult(null);
     setPhase("idle");
     setError(null);
@@ -4767,6 +4787,7 @@ function App() {
       refreshSavedChannelsInBackground(setFavorites);
       apiRequest("/auth/me").then(function (data) {
         if (data.usage) setChannelUsage(data.usage);
+        setGeminiTopicAnalysis(data.features ? data.features.geminiTopicAnalysis !== false : true);
       }).catch(function () { /* ignore */ });
     }} />;
   }
@@ -4960,6 +4981,7 @@ function App() {
                 channelId={result.channel.id}
                 allVideos={result.classified}
                 onClassificationsUpdated={refreshTopicClassifications}
+                canUseGemini={!API_BASE || geminiTopicAnalysis}
               />
 
           </div>

@@ -106,6 +106,10 @@ INSERT INTO app_settings (key, value)
 VALUES ('max_channels_per_user', '5')
 ON CONFLICT (key) DO NOTHING;
 
+INSERT INTO app_settings (key, value)
+VALUES ('gemini_enabled_for_users', 'true')
+ON CONFLICT (key) DO NOTHING;
+
 ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT FALSE;
 
 ALTER TABLE channels ADD COLUMN IF NOT EXISTS cached_videos JSONB NOT NULL DEFAULT '[]'::jsonb;
