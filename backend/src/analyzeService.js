@@ -3,6 +3,7 @@ import { parseChannelAttempts, lookupHandleKey, isCacheFresh } from "./handle.js
 import { fetchChannelFromYouTube, QuotaTracker } from "./youtube.js";
 import { logUserActivity } from "./userService.js";
 import { sanitizeClassificationsMap } from "./topicService.js";
+import { logApiUsageBatch } from "./usageService.js";
 
 const CHANNEL_SELECT = `
   channel_id,
@@ -169,29 +170,7 @@ export async function upsertChannelCache(client, {
 }
 
 export async function logQuotaUsage(client, { calls, channelId, requestSource, userId = null }) {
-  if (!calls.length) return;
-
-  const endpoints = [];
-  const units = [];
-  const channelIds = [];
-  const sources = [];
-  const userIds = [];
-
-  for (const call of calls) {
-    endpoints.push(call.endpoint);
-    units.push(call.units);
-    channelIds.push(channelId || null);
-    sources.push(requestSource || null);
-    userIds.push(userId || null);
-  }
-
-  await client.query(
-    `INSERT INTO quota_logs (endpoint, units, channel_id, request_source, user_id)
-     SELECT e, u, c, s, uid
-     FROM unnest($1::text[], $2::int[], $3::text[], $4::text[], $5::uuid[])
-       AS t(e, u, c, s, uid)`,
-    [endpoints, units, channelIds, sources, userIds]
-  );
+  return logApiUsageBatch(client, { calls, channelId, requestSource, userId });
 }
 
 export function toAnalyzeResponse(row, rawVideos, source, unitsUsed) {

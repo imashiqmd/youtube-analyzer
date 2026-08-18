@@ -276,6 +276,53 @@ function GeminiApiSettings(props) {
   );
 }
 
+function ApiUsageSection(props) {
+  const stats = props.stats;
+  const title = props.title || "API";
+  const endpointLabel = props.endpointLabel || "Endpoint";
+  if (!stats) return null;
+  const totals = stats.totals || {};
+  return (
+    <div className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
+      <h2 className="text-sm font-bold uppercase tracking-wide text-slate-500">{title}</h2>
+      <div className="mt-4 grid grid-cols-2 gap-3 lg:grid-cols-4">
+        <AdminStatCard label="Today" value={totals.todayUnits} note={totals.todayCalls + " calls"} />
+        <AdminStatCard label="All time" value={totals.allTimeUnits} note={totals.allTimeCalls + " calls"} />
+        <AdminStatCard label="Users" value={totals.uniqueUsers} note="with usage" />
+      </div>
+      <div className="mt-5">
+        <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">By {endpointLabel.toLowerCase()}</h3>
+        <AdminTable columns={[
+          { key: "endpoint", label: endpointLabel },
+          { key: "calls", label: "Calls" },
+          { key: "units", label: "Units" },
+        ]} rows={stats.byEndpoint || []} />
+      </div>
+      <div className="mt-5">
+        <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">By user</h3>
+        <AdminTable columns={[
+          { key: "email", label: "User" },
+          { key: "calls", label: "Calls" },
+          { key: "units", label: "Units" },
+        ]} rows={stats.byUser || []} />
+      </div>
+      <div className="mt-5">
+        <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">Last 30 days</h3>
+        <AdminTable columns={[
+          { key: "day", label: "Day", render: function (r) { return formatDate(r.day); } },
+          { key: "calls", label: "Calls" },
+          { key: "units", label: "Units" },
+        ]} rows={stats.byDay || []} />
+      </div>
+    </div>
+  );
+}
+
+function formatApiServiceLabel(service) {
+  if (service === "gemini") return "Gemini";
+  return "YouTube";
+}
+
 function UsersAnalysisPanel(props) {
   const [expandedId, setExpandedId] = useState(null);
   const users = props.users || [];
@@ -315,8 +362,12 @@ function UsersAnalysisPanel(props) {
                 <div className="mb-3 grid grid-cols-2 gap-3 text-sm sm:grid-cols-4">
                   <div><span className="text-slate-500">Joined</span><div className="font-medium">{formatDate(user.createdAt)}</div></div>
                   <div><span className="text-slate-500">Saved</span><div className="font-medium">{user.savedCount}</div></div>
+                  <div><span className="text-slate-500">YouTube API</span><div className="font-medium">{user.youtubeUnits || 0} units</div></div>
+                  <div><span className="text-slate-500">Gemini API</span><div className="font-medium">{user.geminiUnits || 0} calls</div></div>
+                </div>
+                <div className="mb-3 grid grid-cols-2 gap-3 text-sm sm:grid-cols-4">
                   <div><span className="text-slate-500">Activity</span><div className="font-medium">{user.activityCount}</div></div>
-                  <div><span className="text-slate-500">API units</span><div className="font-medium">{user.quotaUnits}</div></div>
+                  <div><span className="text-slate-500">Total API</span><div className="font-medium">{user.quotaUnits} units</div></div>
                 </div>
                 {channels.length ? (
                   <div className="overflow-x-auto rounded-lg border border-slate-200">
@@ -534,7 +585,8 @@ function AdminDashboard(props) {
               <AdminStatCard label="Videos stored" value={totals.videos} />
               <AdminStatCard label="Saved channels" value={totals.savedChannels} />
               <AdminStatCard label="Activity events" value={totals.activityEvents} />
-              <AdminStatCard label="API units today" value={totals.todayUnits} note={totals.todayCalls + " calls today"} />
+              <AdminStatCard label="YouTube API today" value={totals.youtubeTodayUnits} note={totals.youtubeTodayCalls + " calls"} />
+              <AdminStatCard label="Gemini API today" value={totals.geminiTodayUnits} note={totals.geminiTodayCalls + " calls"} />
               <AdminStatCard label="API units used" value={totals.quotaUnitsUsed} note={totals.quotaApiCalls + " calls all time"} />
               <AdminStatCard label="Cache hits" value={totals.cacheHits} />
               <AdminStatCard label="API fetches" value={totals.apiFetches} />
@@ -551,6 +603,7 @@ function AdminDashboard(props) {
               <h2 className="mb-3 text-sm font-bold uppercase tracking-wide text-slate-500">Recent API usage</h2>
               <AdminTable columns={[
                 { key: "createdAt", label: "Time", render: function (r) { return formatDateTime(r.createdAt); } },
+                { key: "apiService", label: "Service", render: function (r) { return formatApiServiceLabel(r.apiService); } },
                 { key: "userEmail", label: "User" }, { key: "endpoint", label: "Endpoint" }, { key: "units", label: "Units" },
                 { key: "channelId", label: "Channel" }, { key: "requestSource", label: "Source" },
               ]} rows={dashboard.recentQuota || []} />
@@ -578,33 +631,24 @@ function AdminDashboard(props) {
           <div className="space-y-6">
             {quotaStats && (
               <>
-                <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
-                  <AdminStatCard label="Today" value={quotaStats.totals.todayUnits} note={quotaStats.totals.todayCalls + " calls"} />
-                  <AdminStatCard label="All time" value={quotaStats.totals.allTimeUnits} note={quotaStats.totals.allTimeCalls + " calls"} />
-                  <AdminStatCard label="Users with API usage" value={quotaStats.totals.uniqueUsers} />
-                </div>
-                <div>
-                  <h2 className="mb-3 text-sm font-bold uppercase tracking-wide text-slate-500">By endpoint</h2>
-                  <AdminTable columns={[{ key: "endpoint", label: "Endpoint" }, { key: "calls", label: "Calls" }, { key: "units", label: "Units" }]} rows={quotaStats.byEndpoint || []} />
-                </div>
-                <div>
-                  <h2 className="mb-3 text-sm font-bold uppercase tracking-wide text-slate-500">By user</h2>
-                  <AdminTable columns={[{ key: "email", label: "User" }, { key: "calls", label: "Calls" }, { key: "units", label: "Units" }]} rows={quotaStats.byUser || []} />
-                </div>
-                <div>
-                  <h2 className="mb-3 text-sm font-bold uppercase tracking-wide text-slate-500">Last 30 days</h2>
-                  <AdminTable columns={[
-                    { key: "day", label: "Day", render: function (r) { return formatDate(r.day); } },
-                    { key: "calls", label: "Calls" }, { key: "units", label: "Units" },
-                  ]} rows={quotaStats.byDay || []} />
-                </div>
+                <ApiUsageSection
+                  title="YouTube Data API"
+                  endpointLabel="Endpoint"
+                  stats={quotaStats.youtube}
+                />
+                <ApiUsageSection
+                  title="Gemini API"
+                  endpointLabel="Model"
+                  stats={quotaStats.gemini}
+                />
               </>
             )}
             <div>
               <h2 className="mb-3 text-sm font-bold uppercase tracking-wide text-slate-500">Recent API calls</h2>
               <AdminTable columns={[
                 { key: "createdAt", label: "Time", render: function (r) { return formatDateTime(r.createdAt); } },
-                { key: "userEmail", label: "User" }, { key: "endpoint", label: "Endpoint" }, { key: "units", label: "Units" },
+                { key: "apiService", label: "Service", render: function (r) { return formatApiServiceLabel(r.apiService); } },
+                { key: "userEmail", label: "User" }, { key: "endpoint", label: "Endpoint / Model" }, { key: "units", label: "Units" },
                 { key: "channelId", label: "Channel" }, { key: "requestSource", label: "Source" },
               ]} rows={quotaLogs} />
             </div>

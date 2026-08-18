@@ -23,6 +23,7 @@ import {
 } from "./adminService.js";
 import { getAppSettings, setMaxChannelsPerUser, setGeminiEnabledForUsers, assertGeminiAllowedForUser, canUserUseGemini, getGeminiEnabledForUsers } from "./settingsService.js";
 import { getTopicClassifications, mergeTopicClassifications } from "./topicService.js";
+import { logGeminiUsage } from "./usageService.js";
 
 const app = express();
 const port = Number(process.env.PORT || 3001);
@@ -243,6 +244,23 @@ app.put("/channels/:channelId/topic-classifications", requireAuth, async (req, r
       metadata: { count: Object.keys(classifications).length },
     });
     res.json({ channelId, topicClassifications });
+  } catch (err) {
+    const status = err.status || 500;
+    res.status(status).json({ error: err.message, code: err.code || undefined });
+  }
+});
+
+app.post("/usage/gemini", requireAuth, async (req, res) => {
+  const { channelId, model, videosClassified } = req.body || {};
+  try {
+    await assertGeminiAllowedForUser(req.user);
+    await logGeminiUsage({
+      userId: req.user.id,
+      channelId: channelId || null,
+      model: model || "generateContent",
+      videosClassified: Number(videosClassified) || 0,
+    });
+    res.json({ ok: true });
   } catch (err) {
     const status = err.status || 500;
     res.status(status).json({ error: err.message, code: err.code || undefined });

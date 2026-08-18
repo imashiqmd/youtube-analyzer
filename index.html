@@ -146,6 +146,22 @@ async function saveTopicClassificationsToApi(channelId, classifications) {
   return data.topicClassifications || null;
 }
 
+async function logGeminiUsageToApi(channelId, model, videosClassified) {
+  if (!API_BASE || !getStoredAuthToken()) return;
+  try {
+    await apiRequest("/usage/gemini", {
+      method: "POST",
+      body: {
+        channelId: channelId,
+        model: model,
+        videosClassified: videosClassified || 0,
+      },
+    });
+  } catch (e) {
+    console.warn("Could not log Gemini API usage:", e);
+  }
+}
+
 async function applyTopicClassificationsToVideos(channelId, videos, topicMap) {
   if (!videos || !videos.length || !topicMap) return 0;
   let applied = 0;
@@ -2240,7 +2256,7 @@ async function callGeminiJson(prompt) {
         const cleaned = text.replace(/```json\s*/gi, "").replace(/```/g, "").trim();
         const parsed = JSON.parse(cleaned);
         if (!Array.isArray(parsed)) throw new Error("Gemini response was not a JSON array.");
-        return parsed;
+        return { results: parsed, model: model };
       }
 
       const errText = await res.text();
@@ -2331,8 +2347,11 @@ async function classifyVideosWithGemini(channelId, videos, options) {
     }
 
     let results;
+    let modelUsed = null;
     try {
-      results = await callGeminiJson(buildGeminiClassificationPrompt(batch, topicList));
+      const geminiResponse = await callGeminiJson(buildGeminiClassificationPrompt(batch, topicList));
+      results = geminiResponse.results;
+      modelUsed = geminiResponse.model;
     } catch (e) {
       // Keep any progress already saved; surface a soft stop for quota/overload
       if (e && (e.status === 429 || e.status === 503) && classified > 0) {
@@ -2371,6 +2390,7 @@ async function classifyVideosWithGemini(channelId, videos, options) {
       } catch (e) {
         console.warn("Could not save topic classifications to server:", e);
       }
+      logGeminiUsageToApi(channelId, modelUsed, Object.keys(batchSaved).length);
     }
 
     if (i + GEMINI_BATCH_SIZE < unclassified.length) {

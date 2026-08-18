@@ -48,6 +48,9 @@ CREATE INDEX IF NOT EXISTS idx_users_email_lower ON users (LOWER(email));
 ALTER TABLE quota_logs ADD COLUMN IF NOT EXISTS user_id UUID REFERENCES users(id) ON DELETE SET NULL;
 CREATE INDEX IF NOT EXISTS idx_quota_logs_user_id ON quota_logs (user_id);
 
+ALTER TABLE quota_logs ADD COLUMN IF NOT EXISTS api_service TEXT NOT NULL DEFAULT 'youtube';
+CREATE INDEX IF NOT EXISTS idx_quota_logs_api_service ON quota_logs (api_service);
+
 CREATE TABLE IF NOT EXISTS sessions (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
