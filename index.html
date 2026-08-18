@@ -2785,56 +2785,226 @@ const TITLE_FORMAT_DEFS = [
   { id: "best-top", label: "Best/Top", shortLabel: "Best/Top" },
   { id: "experience", label: "Experience/Experiment", shortLabel: "Experience" },
   { id: "news-update", label: "News/Update", shortLabel: "News" },
+  { id: "personal-story", label: "Story / Personal Story", shortLabel: "Story" },
+  { id: "announcement", label: "Announcement", shortLabel: "Announce" },
+  { id: "problem-solution", label: "Problem / Solution", shortLabel: "Problem" },
+  { id: "reasons-why", label: "Reasons / Why", shortLabel: "Reasons" },
+  { id: "educational", label: "Educational / Explainer", shortLabel: "Explain" },
+  { id: "opinion", label: "Opinion / Commentary", shortLabel: "Opinion" },
+  { id: "prediction", label: "Prediction / Future", shortLabel: "Predict" },
+  { id: "case-study", label: "Case Study / Breakdown", shortLabel: "Case" },
+  { id: "challenge", label: "Challenge", shortLabel: "Challenge" },
+  { id: "mistakes-warnings", label: "Mistakes / Warnings", shortLabel: "Mistakes" },
+  { id: "tips-advice", label: "Tips / Advice", shortLabel: "Tips" },
+  { id: "beginner", label: "Beginner / Starter", shortLabel: "Beginner" },
+  { id: "deep-dive", label: "Deep Dive / Analysis", shortLabel: "Deep dive" },
+  { id: "ranking", label: "Ranking", shortLabel: "Ranking" },
+  { id: "reaction", label: "Reaction", shortLabel: "Reaction" },
+  { id: "documentary", label: "Documentary / Story", shortLabel: "Doc" },
   { id: "other", label: "Other", shortLabel: "Other" },
 ];
 const TITLE_FORMAT_MIN_INSIGHT_VIDEOS = 3;
 
+function normalizeTitleForFormatClassification(title) {
+  return (title || "").trim().replace(/\s+/g, " ");
+}
+
+function titleFormatWordCount(title) {
+  return normalizeTitleForFormatClassification(title).split(/\s+/).filter(Boolean).length;
+}
+
+function titleHasPhrase(title, pattern) {
+  return pattern.test(normalizeTitleForFormatClassification(title));
+}
+
+function titleHasAnyPhrase(title, patterns) {
+  return patterns.some(function (pattern) { return titleHasPhrase(title, pattern); });
+}
+
+function titleSignalCount(title, patterns) {
+  let count = 0;
+  patterns.forEach(function (pattern) {
+    if (titleHasPhrase(title, pattern)) count++;
+  });
+  return count;
+}
+
+function titleHasFirstPerson(title) {
+  return /\b(i|my|me|we|our|i'm|i've|i'll|we're|we've)\b/i.test(normalizeTitleForFormatClassification(title));
+}
+
 function extractTitleCharacteristics(title) {
-  const t = (title || "").trim();
+  const t = normalizeTitleForFormatClassification(title);
+  const lower = t.toLowerCase();
   return {
-    has_question: /\?/.test(t) || /^(why|what|how|is|can|should|will)\b/i.test(t),
+    has_question: /\?/.test(t) || /^(why|what|how|is|can|should|will|are|does|do|did)\b/i.test(t),
     has_number: /\d/.test(t),
     has_vs: /\bvs\.?\b/i.test(t) || /\bversus\b/i.test(t),
     has_colon: /:/.test(t),
     has_brackets: /\[|\]/.test(t),
     has_parentheses: /\(|\)/.test(t),
+    has_first_person: titleHasFirstPerson(t),
+    has_list_pattern: /^\d+[\).\s:-]/.test(t) || /\b\d+\s+(ways|tips|tools|reasons|things|steps|ideas|secrets|mistakes|hacks|tricks)\b/i.test(t),
+    has_tutorial_signal: /\b(tutorial|step[\s-]by[\s-]step|how\s+to)\b/i.test(t),
+    has_news_signal: /\b(breaking|latest|update|announced|released|news)\b/i.test(lower),
+    has_story_signal: /\b(story|journey|documentary|confession)\b/i.test(lower),
   };
 }
 
 function classifyTitleFormat(title) {
-  const t = (title || "").trim();
+  const t = normalizeTitleForFormatClassification(title);
   if (!t) return "other";
 
-  if (/\bhow\s+to\b/i.test(t) || /\bhow\s+i\b/i.test(t) || /\bhow\s+do\s+i\b/i.test(t)) {
+  const words = titleFormatWordCount(t);
+  const firstPerson = titleHasFirstPerson(t);
+
+  if (titleHasAnyPhrase(t, [/\bvs\.?\b/i, /\bversus\b/i]) && words >= 3) {
+    return "comparison";
+  }
+
+  if (
+    titleHasAnyPhrase(t, [/\b\d+\s*(-\s*)?day\s+challenge\b/i, /\b\d+\s+week\s+challenge\b/i]) ||
+    (titleHasPhrase(t, /\bchallenge\b/i) && (titleHasPhrase(t, /\bfor\s+\d+\s+days\b/i) || firstPerson) && words >= 4)
+  ) {
+    return "challenge";
+  }
+
+  if (titleHasAnyPhrase(t, [/\breaction\s+to\b/i, /\breacts?\s+to\b/i, /\breacting\s+to\b/i, /\bmy\s+reaction\b/i]) && words >= 3) {
+    return "reaction";
+  }
+
+  if (titleHasAnyPhrase(t, [/\btier\s+list\b/i, /\branking\b/i, /\branked\b/i, /\bpower\s+ranking\b/i, /\bevery\s+.+\s+ranked\b/i]) && words >= 3) {
+    return "ranking";
+  }
+
+  if (titleHasAnyPhrase(t, [/\bdocumentary\b/i, /\bthe\s+story\s+of\b/i, /\bstory\s+of\s+the\b/i]) && words >= 4) {
+    return "documentary";
+  }
+
+  if (titleHasAnyPhrase(t, [/\bcase\s+study\b/i, /\bbreakdown\s+of\b/i, /\bfull\s+breakdown\b/i, /\binside\s+the\b/i]) && words >= 4) {
+    return "case-study";
+  }
+
+  if (titleHasAnyPhrase(t, [/\bdeep\s+dive\b/i, /\bin[\s-]depth\s+analysis\b/i, /\bfull\s+analysis\b/i, /\banalyzing\b/i, /\banalysis\s+of\b/i]) && words >= 4) {
+    return "deep-dive";
+  }
+
+  if (
+    titleHasPhrase(t, /\bmy\s+story\b/i) ||
+    (firstPerson && titleHasAnyPhrase(t, [/\bwhat\s+happened\s+when\b/i, /\bwhat\s+happened\s+to\b/i, /\bmy\s+journey\b/i, /\bconfession\b/i]) && words >= 5)
+  ) {
+    return "personal-story";
+  }
+
+  if (
+    firstPerson &&
+    titleHasAnyPhrase(t, [/\bi\s+tried\b/i, /\bi\s+tested\b/i, /\bi\s+used\b/i, /\bi\s+built\b/i, /\bi\s+spent\b/i, /\bi\s+learned\b/i, /\bexperiment\b/i, /\bi\s+quit\b/i]) &&
+    words >= 4
+  ) {
+    return "experience";
+  }
+
+  if (
+    titleHasAnyPhrase(t, [/\bhow\s+to\b/i, /\btutorial\b/i, /\bstep[\s-]by[\s-]step\b/i]) ||
+    (titleHasAnyPhrase(t, [/\bhow\s+i\b/i, /\bhow\s+we\b/i, /\bhow\s+do\s+i\b/i]) && words >= 5)
+  ) {
     return "how-to";
   }
-  if (/\?/.test(t) || /^(why|what|how|is|can|should|will)\b/i.test(t)) {
+
+  if (
+    (titleHasAnyPhrase(t, [/\bsolution\s+to\b/i, /\bhow\s+to\s+fix\b/i, /\bproblem\s+with\b/i, /\bfix\s+this\b/i]) &&
+      titleHasAnyPhrase(t, [/\bproblem\b/i, /\bissue\b/i, /\berror\b/i, /\bfix\b/i, /\bsolution\b/i, /\bworkaround\b/i, /\btroubleshoot\b/i])) ||
+    titleHasPhrase(t, /\bproblem\s+.+\s+solution\b/i)
+  ) {
+    return "problem-solution";
+  }
+
+  if (
+    /\?\s*$/.test(t) ||
+    (/^(why|what|how|is|are|can|should|will|does|do|did|was|were|could|would)\b/i.test(t) && words >= 4 && !titleHasPhrase(t, /\bhow\s+to\b/i))
+  ) {
     return "question";
   }
+
   if (
-    /^\d/.test(t) ||
-    /\b\d+\s+(ways|tips|tools|reasons|things|steps|ideas|secrets|mistakes|hacks|tricks|methods|apps|sites|websites|plugins|extensions|books|courses|videos|examples|lessons|rules|facts|signs|benefits|uses|features)\b/i.test(t)
+    titleHasAnyPhrase(t, [/\breasons\s+why\b/i, /\breasons\s+to\b/i, /\breasons\s+not\s+to\b/i, /\bwhy\s+i\b/i, /\bwhy\s+you\b/i, /\bwhy\s+we\b/i, /\bwhy\s+this\b/i]) &&
+    words >= 4 &&
+    !/\?\s*$/.test(t)
+  ) {
+    return "reasons-why";
+  }
+
+  if (
+    titleSignalCount(t, [/\bmistake/i, /\bwarning/i, /\bdon'?t\b/i, /\bnever\b/i, /\bavoid\b/i, /\bstop\b/i]) >= 2 ||
+    titleHasAnyPhrase(t, [/\bmistakes\s+(to\s+)?avoid\b/i, /\bnever\s+do\b/i, /\bwarning\b/i])
+  ) {
+    return "mistakes-warnings";
+  }
+
+  if (titleHasAnyPhrase(t, [/\btips\s+for\b/i, /\btips\s+to\b/i, /\badvice\s+for\b/i, /\bpro\s+tips\b/i, /\bquick\s+tips\b/i, /\bexpert\s+tips\b/i]) && words >= 4) {
+    return "tips-advice";
+  }
+
+  if (
+    /^\d+[\).\s:-]/.test(t) ||
+    /^\d+\s+(best|top|ways|tips|tools|reasons|things|steps|ideas|secrets|mistakes|hacks|tricks|methods|apps|rules|facts|signs|benefits|uses|features|examples|lessons)\b/i.test(t) ||
+    (titleHasPhrase(t, /\b\d+\s+(ways|tips|tools|reasons|things|steps|ideas|secrets|mistakes|hacks|tricks)\b/i) && words >= 5)
   ) {
     return "list-number";
   }
-  if (/\bvs\.?\b/i.test(t) || /\bversus\b/i.test(t)) {
-    return "comparison";
-  }
-  if (/\breview\b/i.test(t) || /\btested\b/i.test(t) || /\btesting\b/i.test(t) || /\bhands[\s-]?on\b/i.test(t)) {
-    return "review";
-  }
-  if (/\bguide\b/i.test(t) || /\bcomplete\s+guide\b/i.test(t) || /\bultimate\s+guide\b/i.test(t) || /\bbeginner'?s?\s+guide\b/i.test(t)) {
-    return "guide";
-  }
-  if (/^(best|top)\b/i.test(t)) {
+
+  if (/^(best|top)\b/i.test(t) && words >= 3 && !/^\d/.test(t)) {
     return "best-top";
   }
-  if (/\bi\s+tried\b/i.test(t) || /\bi\s+tested\b/i.test(t) || /\bi\s+used\b/i.test(t) || /\bi\s+built\b/i.test(t) || /\bi\s+spent\b/i.test(t)) {
-    return "experience";
+
+  if (
+    titleHasAnyPhrase(t, [/\breview\b/i, /\btested\b/i, /\btesting\b/i, /\bhands[\s-]?on\b/i, /\bunboxing\b/i, /\bfirst\s+impressions?\b/i, /\bafter\s+\d+\s+(days|weeks|months)\b/i]) &&
+    words >= 3
+  ) {
+    return "review";
   }
-  if (/\bnew\b/i.test(t) || /\blatest\b/i.test(t) || /\bupdate\b/i.test(t) || /\bannounced\b/i.test(t) || /\bjust\s+released\b/i.test(t)) {
+
+  if (
+    titleHasAnyPhrase(t, [/\bcomplete\s+guide\b/i, /\bultimate\s+guide\b/i, /\bbeginner'?s?\s+guide\b/i, /\bthe\s+only\s+guide\b/i, /\bguide\s+to\b/i]) ||
+    (titleHasPhrase(t, /\bguide\b/i) && words >= 4)
+  ) {
+    return "guide";
+  }
+
+  if (titleHasAnyPhrase(t, [/\bfor\s+beginners\b/i, /\bbeginner\s+friendly\b/i, /\bstarter\s+guide\b/i, /\bgetting\s+started\b/i, /\bintro\s+to\b/i, /\bstart\s+here\b/i]) && words >= 4) {
+    return "beginner";
+  }
+
+  if (
+    titleHasAnyPhrase(t, [/\bexplained\b/i, /\beverything\s+you\s+need\s+to\s+know\b/i, /\bwhat\s+is\b/i, /\bwhat\s+are\b/i, /\bcrash\s+course\b/i, /\blearn\b/i]) &&
+    words >= 4 &&
+    !titleHasPhrase(t, /\bhow\s+to\b/i)
+  ) {
+    return "educational";
+  }
+
+  if (
+    titleHasAnyPhrase(t, [/\bunpopular\s+opinion\b/i, /\bhot\s+take\b/i, /\bmy\s+opinion\b/i, /\bi\s+think\b/i, /\btruth\s+about\b/i, /\bcommentary\b/i]) &&
+    (firstPerson || words >= 4)
+  ) {
+    return "opinion";
+  }
+
+  if (titleHasAnyPhrase(t, [/\bfuture\s+of\b/i, /\bpredictions?\b/i, /\bwhat'?s\s+next\b/i, /\bin\s+20\d{2}\b/i, /\bwill\s+change\b/i, /\bcoming\s+soon\b/i, /\bnext\s+decade\b/i]) && words >= 4) {
+    return "prediction";
+  }
+
+  if (titleHasAnyPhrase(t, [/\bannouncing\b/i, /\bwe'?re\s+launching\b/i, /\bintroducing\b/i, /\bbig\s+announcement\b/i, /\bofficial\s+announcement\b/i, /\bi'?m\s+launching\b/i]) && words >= 3) {
+    return "announcement";
+  }
+
+  if (
+    titleHasAnyPhrase(t, [/\bbreaking\b/i, /\blatest\s+news\b/i, /\bjust\s+announced\b/i, /\bjust\s+released\b/i, /\bnews\s+update\b/i, /\bupdate\s+on\b/i, /\bofficial\s+update\b/i]) ||
+    (titleSignalCount(t, [/\blatest\b/i, /\bupdate\b/i, /\bnew\b/i, /\bnews\b/i, /\breleased\b/i, /\bannounced\b/i]) >= 2 && words >= 4)
+  ) {
     return "news-update";
   }
+
   return "other";
 }
 
