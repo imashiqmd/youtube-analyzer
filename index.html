@@ -2691,19 +2691,6 @@ function countTitleChars(title) {
   return (title || "").trim().length;
 }
 
-function enrichTitleVideo(video) {
-  const title = video.title || "";
-  return {
-    id: video.id,
-    title: title,
-    publishedAt: video.publishedAt,
-    category: video.category,
-    viewCount: video.viewCount,
-    charCount: countTitleChars(title),
-    wordCount: countTitleWords(title),
-  };
-}
-
 function computeTitleLabSlice(currentItems, periodLabel) {
   if (!currentItems.length) {
     return {
@@ -2718,23 +2705,17 @@ function computeTitleLabSlice(currentItems, periodLabel) {
       maxCharCount: 0,
       minWordCount: 0,
       maxWordCount: 0,
-      videos: [],
     };
   }
 
-  const videos = currentItems.map(enrichTitleVideo);
-  const charCounts = videos.map(function (v) { return v.charCount; });
-  const wordCounts = videos.map(function (v) { return v.wordCount; });
+  const charCounts = currentItems.map(function (v) { return countTitleChars(v.title); });
+  const wordCounts = currentItems.map(function (v) { return countTitleWords(v.title); });
   const sum = function (arr) { return arr.reduce(function (a, b) { return a + b; }, 0); };
-
-  videos.sort(function (a, b) {
-    return new Date(b.publishedAt) - new Date(a.publishedAt);
-  });
 
   return {
     periodLabel: periodLabel,
     hasData: true,
-    count: videos.length,
+    count: currentItems.length,
     avgCharCount: sum(charCounts) / charCounts.length,
     medianCharCount: medianValue(charCounts),
     avgWordCount: sum(wordCounts) / wordCounts.length,
@@ -2743,7 +2724,6 @@ function computeTitleLabSlice(currentItems, periodLabel) {
     maxCharCount: Math.max.apply(null, charCounts),
     minWordCount: Math.min.apply(null, wordCounts),
     maxWordCount: Math.max.apply(null, wordCounts),
-    videos: videos,
   };
 }
 
@@ -4042,46 +4022,10 @@ function ContentTopicsPanel(props) {
   );
 }
 
-function TitleVideoRow(props) {
-  const video = props.video;
-  const showFormat = props.showFormat;
-  return (
-    <li className="rounded-lg border border-slate-100 bg-white px-3 py-2.5 shadow-sm">
-      <div className="flex items-start gap-3">
-        <div className="min-w-0 flex-1">
-          <div className="flex flex-wrap items-center gap-1.5">
-            <a
-              href={"https://www.youtube.com/watch?v=" + video.id}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="line-clamp-2 font-semibold text-slate-900 hover:text-sky-700"
-            >
-              {video.title}
-            </a>
-            {showFormat && (
-              <span className={"shrink-0 rounded-full px-1.5 py-0.5 text-[10px] font-semibold uppercase " + formatCategoryBadgeClass(video.category)}>
-                {formatCategoryLabel(video.category)}
-              </span>
-            )}
-          </div>
-          <p className="mt-1 text-xs text-slate-500">
-            {formatNumber(video.viewCount)} views · {formatDate(video.publishedAt)}
-          </p>
-        </div>
-        <div className="shrink-0 text-right">
-          <p className="text-sm font-bold text-slate-900">{formatTitleMetric(video.charCount)} chars</p>
-          <p className="text-[11px] text-slate-400">{formatTitleMetric(video.wordCount)} words</p>
-        </div>
-      </div>
-    </li>
-  );
-}
-
 function TitleLabPanel(props) {
   const titleLab = props.titleLab;
   const range = props.range;
   const [contentFormat, setContentFormat] = useState("all");
-  const [showAllVideos, setShowAllVideos] = useState(false);
   if (!titleLab) return null;
 
   const active = (titleLab.formats && titleLab.formats[contentFormat]) || titleLab.formats.all;
@@ -4093,14 +4037,6 @@ function TitleLabPanel(props) {
     live: "No live streams published in this period to analyze titles.",
   };
 
-  function handleFormatChange(next) {
-    setContentFormat(next);
-    setShowAllVideos(false);
-  }
-
-  const allVideos = active.videos || [];
-  const visibleVideos = showAllVideos ? allVideos : allVideos.slice(0, 5);
-  const canShowMoreVideos = allVideos.length > 5;
   const summaryMetrics = [
     {
       label: "Avg characters",
@@ -4142,7 +4078,7 @@ function TitleLabPanel(props) {
           />
         }
       >
-        <ContentFormatSelector value={contentFormat} onChange={handleFormatChange} />
+        <ContentFormatSelector value={contentFormat} onChange={setContentFormat} />
       </PanelSectionHeader>
       {titleLab.periodLabel && (
         <p className="mt-2 text-[11px] text-slate-400">
@@ -4185,34 +4121,6 @@ function TitleLabPanel(props) {
               </div>
             )}
           </div>
-
-          {allVideos.length > 0 && (
-            <div className="mt-5">
-              <InsightSectionTitle hint="Every video title in this period with its character and word count.">
-                All titles
-              </InsightSectionTitle>
-              <ol className="mt-2 space-y-2">
-                {visibleVideos.map(function (video) {
-                  return (
-                    <TitleVideoRow
-                      key={video.id}
-                      video={video}
-                      showFormat={contentFormat === "all"}
-                    />
-                  );
-                })}
-              </ol>
-              {canShowMoreVideos && (
-                <button
-                  type="button"
-                  onClick={function () { setShowAllVideos(!showAllVideos); }}
-                  className="mt-2 text-xs font-semibold text-sky-700 hover:text-sky-800"
-                >
-                  {showAllVideos ? "Show less" : "Show all " + allVideos.length + " titles"}
-                </button>
-              )}
-            </div>
-          )}
         </>
       )}
     </div>
