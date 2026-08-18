@@ -3187,7 +3187,7 @@ function buildTitleFormatPerformance(items) {
       formats: [],
       channelMedianViews: channelMedianViews,
       bestFormatId: null,
-      insight: "Analyzing title formats with Gemini AI for videos in this period…",
+      insight: "Click Run to classify title formats with Gemini AI for videos in this period. Saved results are reused from the database.",
       hasEnoughData: false,
       classifiedCount: 0,
       pendingCount: pendingCount,
@@ -4767,7 +4767,14 @@ function TitleFormatPerformanceBlock(props) {
 
   if (!data) return null;
 
-  const best = data.bestFormatId && data.formats && data.formats.length
+  const hasFormatResults = data.formats && data.formats.length > 0;
+  const canRunClassification = props.canRunClassification;
+  const classifying = props.classifying;
+  const classifyError = props.classifyError;
+  const classifyMsg = props.classifyMsg;
+  const geminiDisabled = props.geminiDisabled;
+
+  const best = data.bestFormatId && hasFormatResults
     ? data.formats.find(function (f) { return f.id === data.bestFormatId; })
     : null;
   const chartFormats = (data.formats || []).filter(function (f) { return f.count > 0; });
@@ -4782,24 +4789,103 @@ function TitleFormatPerformanceBlock(props) {
     setExpandedFormatId(function (current) { return current === formatId ? null : formatId; });
   }
 
-  if (!data.formats || !data.formats.length) {
+  if (!hasFormatResults) {
     return (
       <div className="mt-5">
-        <InsightSectionTitle hint="Gemini AI classifies each title into a meaningful format pattern. Performance Index = format median views ÷ channel median views in this period.">
-          Title Format Performance
-        </InsightSectionTitle>
-        {data.insight && (
-          <p className="mt-2 text-sm leading-relaxed text-slate-500">{data.insight}</p>
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <InsightSectionTitle hint="Gemini AI classifies each title into a meaningful format pattern. Results are saved to the database and reused. Performance Index = format median views ÷ channel median views in this period.">
+            Title Format Performance
+          </InsightSectionTitle>
+          {canRunClassification && (
+            <button
+              type="button"
+              onClick={props.onRunClassification}
+              disabled={classifying}
+              className="inline-flex h-[34px] items-center justify-center gap-1.5 rounded-lg bg-slate-900 px-3 text-xs font-semibold text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {classifying ? <Spinner className="h-3.5 w-3.5 text-white" /> : null}
+              {classifying ? "Running…" : "Run"}
+            </button>
+          )}
+        </div>
+
+        {geminiDisabled && (
+          <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2.5 text-sm text-amber-800">
+            AI title format analysis is turned off for users right now. You can still view formats already saved in the database.
+          </div>
         )}
+
+        {(classifying || classifyError || classifyMsg) && (
+          <div className={"mt-3 flex items-start gap-2 rounded-lg border px-3 py-2.5 text-sm " +
+            (classifyError
+              ? (classifyError.indexOf("quota") >= 0 || classifyError.indexOf("Quota") >= 0
+                ? "border-amber-200 bg-amber-50 text-amber-800"
+                : "border-rose-200 bg-rose-50 text-rose-700")
+              : "border-slate-200 bg-slate-50 text-slate-600")}>
+            {classifying && !classifyError ? <Spinner className="mt-0.5 h-4 w-4 shrink-0 text-slate-500" /> : null}
+            <span>{classifyError || classifyMsg}</span>
+          </div>
+        )}
+
+        {!classifying && canRunClassification ? (
+          <div className="mt-4 rounded-xl border border-dashed border-slate-200 bg-slate-50/80 px-4 py-5 text-center">
+            <p className="text-sm font-medium text-slate-700">Title format analysis is ready to run</p>
+            <p className="mt-1 text-sm text-slate-500">
+              This uses Gemini AI to classify titles in the selected period. It does not start automatically so you can avoid unnecessary API usage. Saved results are reused from the database.
+            </p>
+            <button
+              type="button"
+              onClick={props.onRunClassification}
+              disabled={classifying}
+              className="mt-4 inline-flex items-center justify-center gap-2 rounded-xl bg-slate-900 px-4 py-2 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {classifying ? <Spinner className="h-4 w-4 text-white" /> : null}
+              {classifying ? "Running…" : "Run title format analysis"}
+            </button>
+          </div>
+        ) : data.insight ? (
+          <p className="mt-3 text-sm leading-relaxed text-slate-500">{data.insight}</p>
+        ) : null}
       </div>
     );
   }
 
   return (
     <div className="mt-5">
-      <InsightSectionTitle hint="Gemini AI classifies each title into a meaningful format pattern. Performance Index = format median views ÷ channel median views in this period.">
-        Title Format Performance
-      </InsightSectionTitle>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <InsightSectionTitle hint="Gemini AI classifies each title into a meaningful format pattern. Results are saved to the database and reused. Performance Index = format median views ÷ channel median views in this period.">
+          Title Format Performance
+        </InsightSectionTitle>
+        {canRunClassification && (
+          <button
+            type="button"
+            onClick={props.onRunClassification}
+            disabled={classifying}
+            className="inline-flex h-[34px] items-center justify-center gap-1.5 rounded-lg bg-slate-900 px-3 text-xs font-semibold text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {classifying ? <Spinner className="h-3.5 w-3.5 text-white" /> : null}
+            {classifying ? "Running…" : "Run"}
+          </button>
+        )}
+      </div>
+
+      {geminiDisabled && (
+        <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2.5 text-sm text-amber-800">
+          AI title format analysis is turned off for users right now. You can still view formats already saved in the database.
+        </div>
+      )}
+
+      {(classifying || classifyError || classifyMsg) && (
+        <div className={"mt-3 flex items-start gap-2 rounded-lg border px-3 py-2.5 text-sm " +
+          (classifyError
+            ? (classifyError.indexOf("quota") >= 0 || classifyError.indexOf("Quota") >= 0
+              ? "border-amber-200 bg-amber-50 text-amber-800"
+              : "border-rose-200 bg-rose-50 text-rose-700")
+            : "border-slate-200 bg-slate-50 text-slate-600")}>
+          {classifying && !classifyError ? <Spinner className="mt-0.5 h-4 w-4 shrink-0 text-slate-500" /> : null}
+          <span>{classifyError || classifyMsg}</span>
+        </div>
+      )}
 
       {best && (
         <div className="mt-3 rounded-xl border border-emerald-200 bg-emerald-50/70 px-4 py-3">
@@ -4942,6 +5028,9 @@ function TitleLabPanel(props) {
   const titleLab = props.titleLab;
   const range = props.range;
   const [contentFormat, setContentFormat] = useState("all");
+  const [classifying, setClassifying] = useState(false);
+  const [classifyMsg, setClassifyMsg] = useState("");
+  const [classifyError, setClassifyError] = useState(null);
   const classifyGenRef = useRef(0);
   if (!titleLab) return null;
 
@@ -4968,11 +5057,22 @@ function TitleLabPanel(props) {
 
   useEffect(function () {
     classifyGenRef.current++;
+    setClassifying(false);
+    setClassifyMsg("");
+    setClassifyError(null);
   }, [props.channelId]);
 
   useEffect(function () {
-    if (!props.channelId || !props.allVideos || !props.allVideos.length || !unclassifiedTitleFormatCount) return;
-    if (props.canUseGemini === false) return;
+    setClassifyMsg("");
+    setClassifyError(null);
+  }, [contentFormat, range]);
+
+  const runTitleFormatClassification = useCallback(function () {
+    if (!props.channelId || !props.allVideos || !props.allVideos.length || !unclassifiedTitleFormatCount || classifying) return;
+    if (props.canUseGemini === false) {
+      setClassifyError("AI title format analysis is currently turned off for users. Admins can still use it.");
+      return;
+    }
 
     const gen = ++classifyGenRef.current;
     const bounds = getRangeBounds(range);
@@ -4982,21 +5082,42 @@ function TitleLabPanel(props) {
     );
     const priorityIds = {};
     periodVideos.forEach(function (v) { priorityIds[v.id] = true; });
-    if (!Object.keys(priorityIds).length) return;
+
+    setClassifying(true);
+    setClassifyError(null);
+    setClassifyMsg("Checking saved title format classifications…");
 
     classifyTitleFormatsWithGemini(props.channelId, props.allVideos, {
       canUseGemini: props.canUseGemini !== false,
       priorityIds: priorityIds,
       periodOnly: true,
-    }).then(function () {
+      onProgress: function (done, total) {
+        if (gen !== classifyGenRef.current) return;
+        if (total > 0) setClassifyMsg("Classifying title formats with Gemini AI… " + done + "/" + total);
+      },
+    }).then(function (result) {
       if (gen !== classifyGenRef.current) return;
       if (props.onClassificationsUpdated) props.onClassificationsUpdated();
+      if (result && result.classified === 0 && result.loadedFromCache > 0) {
+        setClassifyMsg("Loaded " + result.loadedFromCache + " title format" + (result.loadedFromCache === 1 ? "" : "s") + " from database — no Gemini API used.");
+      } else if (result && result.classified === 0 && result.total === 0) {
+        setClassifyMsg("All title formats for this period are already saved in the database.");
+      }
+      if (result && result.stoppedEarly && result.stopReason) {
+        setClassifyError(result.stopReason);
+      }
     }).catch(function (e) {
       if (gen !== classifyGenRef.current) return;
       if (props.onClassificationsUpdated) props.onClassificationsUpdated();
-      console.warn("Title format classification failed:", e);
+      setClassifyError(e.message || String(e));
+    }).finally(function () {
+      if (gen === classifyGenRef.current) setClassifying(false);
     });
-  }, [props.channelId, props.allVideos, props.onClassificationsUpdated, props.canUseGemini, unclassifiedTitleFormatCount, range, contentFormat]);
+  }, [props.channelId, props.allVideos, props.onClassificationsUpdated, props.canUseGemini, unclassifiedTitleFormatCount, classifying, range, contentFormat]);
+
+  const hasTitleFormatResults = active.titleFormatPerformance && active.titleFormatPerformance.formats && active.titleFormatPerformance.formats.length > 0;
+  const canRunTitleFormatClassification = active.hasData && unclassifiedTitleFormatCount > 0 && props.canUseGemini !== false && !hasTitleFormatResults && !classifying;
+  const geminiDisabled = props.canUseGemini === false && unclassifiedTitleFormatCount > 0;
 
   const summaryMetrics = [
     {
@@ -5025,7 +5146,7 @@ function TitleLabPanel(props) {
     <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm sm:p-5">
       <PanelSectionHeader
         title={
-          <PanelTitle hint="Title length and format patterns for videos in the selected period — character counts, length buckets, AI title-format analysis, and which styles perform best. Filter by long-form, Shorts, or Live so formats are not mixed.">
+          <PanelTitle hint="Title length and format patterns for videos in the selected period — character counts, length buckets, and AI title-format analysis. Click Run in Title Format Performance to classify with Gemini. Filter by long-form, Shorts, or Live so formats are not mixed.">
             Title Lab
           </PanelTitle>
         }
@@ -5085,16 +5206,14 @@ function TitleLabPanel(props) {
 
           <TitleLengthPerformanceBlock data={active.titleLengthPerformance} />
           <TitleFormatPerformanceBlock
-            data={
-              props.canUseGemini === false && active.titleFormatPerformance && active.titleFormatPerformance.pendingCount > 0
-                ? Object.assign({}, active.titleFormatPerformance, {
-                  formats: [],
-                  insight: "AI title format analysis is turned off for users right now. Saved classifications will still appear when available.",
-                  hasEnoughData: false,
-                })
-                : active.titleFormatPerformance
-            }
+            data={active.titleFormatPerformance}
             showContentFormat={contentFormat === "all"}
+            onRunClassification={runTitleFormatClassification}
+            canRunClassification={canRunTitleFormatClassification}
+            classifying={classifying}
+            classifyMsg={classifyMsg}
+            classifyError={classifyError}
+            geminiDisabled={geminiDisabled}
           />
         </>
       )}
